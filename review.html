@@ -1,0 +1,774 @@
+<!doctype html>
+<html lang="fr-CA">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Revue — Cours Excel Power Query</title>
+<style>
+  body{margin:0;background:#edebe9;font-family:system-ui,-apple-system,'Segoe UI',Roboto,sans-serif;color:#323130}
+  .wrap{max-width:1100px;margin:0 auto;padding:22px 16px 60px}
+  .lede{font-size:13px;color:#605e5c;margin:0 0 16px;line-height:1.5}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <p class="lede">Cockpit de révision pour un cours de style interactif. Le réviseur lit le script, ESSAIE la simulation (la partie qu'on ne peut pas réviser en regardant), vérifie le quiz, signale les problèmes par catégorie, puis tranche le verdict. « Exporter la revue » produit un JSON prêt à router (contenu vs code).</p>
+  <div id="rv-root"></div>
+</div>
+<script>
+(function(){
+// Moteur de transformation du simulateur Power Query — XGuard Academy
+// Fonctions PURES et testables (aucune dépendance, aucun DOM).
+// Modèle « replay » : on garde les données brutes (raw) + l'historique des actions,
+// et on rejoue l'historique pour matérialiser l'état courant. C'est ce qui permet
+// à « Actualiser » (refresh) de ré-exécuter toutes les étapes sur de nouvelles données,
+// exactement comme le vrai Power Query.
+
+function clone(v) {
+  return JSON.parse(JSON.stringify(v));
+}
+
+// Convertit une valeur texte « sale » en nombre. Gère le format québécois :
+// "14 400,00 $" -> 14400.00 ; "10000" -> 10000 ; déjà nombre -> tel quel.
+function parseNumber(v) {
+  if (typeof v === 'number') return v;
+  if (v == null) return NaN;
+  const cleaned = String(v)
+    .replace(/\s/g, '')
+    .replace(/\$/g, '')
+    .replace(/[^\d,.-]/g, '')
+    .replace(',', '.');
+  const n = Number.parseFloat(cleaned);
+  return Number.isNaN(n) ? NaN : n;
+}
+
+const fmtDecimal = new Intl.NumberFormat('fr-CA', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+const fmtInteger = new Intl.NumberFormat('fr-CA', { maximumFractionDigits: 0 });
+
+// Affichage d'une cellule selon le type de sa colonne.
+function formatCell(value, type) {
+  if (value == null || value === '') return '';
+  if (type === 'decimal') {
+    const n = typeof value === 'number' ? value : parseNumber(value);
+    return Number.isNaN(n) ? String(value) : fmtDecimal.format(n);
+  }
+  if (type === 'integer') {
+    const n = typeof value === 'number' ? value : parseNumber(value);
+    return Number.isNaN(n) ? String(value) : fmtInteger.format(n);
+  }
+  return String(value);
+}
+
+function capitalizeWords(s) {
+  return String(s)
+    .toLowerCase()
+    .replace(/(^|[\s'-])([a-zà-ÿ])/g, (m, p1, p2) => p1 + p2.toUpperCase());
+}
+
+function predicate(cellValue, op, value) {
+  switch (op) {
+    case 'equals': return String(cellValue ?? '') === String(value);
+    case 'notEquals': return String(cellValue ?? '') !== String(value);
+    case 'greaterThan': return parseNumber(cellValue) > parseNumber(value);
+    case 'lessThan': return parseNumber(cellValue) < parseNumber(value);
+    default: return false;
+  }
+}
+
+// ---------- application d'UNE action sur {columns, rows} (pur) ----------
+
+function applyOne(columns, rows, action) {
+  const p = action.params || {};
+  switch (action.type) {
+    case 'chooseSource':
+      return { columns, rows };
+
+    case 'promoteHeaders': {
+      if (rows.length === 0) return { columns, rows };
+      const first = rows[0];
+      const newCols = columns.map((c) => ({ ...c, label: String(first[c.key] ?? c.label) }));
+      return { columns: newCols, rows: rows.slice(1) };
+    }
+
+    case 'removeColumn': {
+      const newCols = columns.filter((c) => c.key !== action.target);
+      const newRows = rows.map((r) => {
+        const { [action.target]: _drop, ...rest } = r;
+        return rest;
+      });
+      return { columns: newCols, rows: newRows };
+    }
+
+    case 'removeBottomRows': {
+      const n = Number(p.count) || 1;
+      return { columns, rows: rows.slice(0, Math.max(0, rows.length - n)) };
+    }
+
+    case 'removeEmptyRows': {
+      const newRows = rows.filter((r) => columns.some((c) => String(r[c.key] ?? '').trim() !== ''));
+      return { columns, rows: newRows };
+    }
+
+    case 'changeType': {
+      const newCols = columns.map((c) => (c.key === action.target ? { ...c, type: p.toType } : c));
+      let newRows = rows;
+      if (p.toType === 'decimal' || p.toType === 'integer') {
+        newRows = rows.map((r) => {
+          if (r[action.target] == null || r[action.target] === '') return r;
+          const n = parseNumber(r[action.target]);
+          if (Number.isNaN(n)) return r;
+          return { ...r, [action.target]: p.toType === 'integer' ? Math.round(n) : n };
+        });
+      }
+      return { columns: newCols, rows: newRows };
+    }
+
+    case 'replaceValue': {
+      const newRows = rows.map((r) =>
+        String(r[action.target] ?? '') === String(p.from) ? { ...r, [action.target]: p.to } : r
+      );
+      return { columns, rows: newRows };
+    }
+
+    case 'filterRows': {
+      const newRows = rows.filter((r) => predicate(r[action.target], p.op, p.value));
+      return { columns, rows: newRows };
+    }
+
+    case 'splitColumn': {
+      const idx = columns.findIndex((c) => c.key === action.target);
+      const keys = p.intoKeys || [];
+      const labels = p.intoLabels || keys;
+      const newSubCols = keys.map((k, i) => ({ key: k, label: labels[i] || k, type: 'text' }));
+      const newCols = idx === -1
+        ? columns.concat(newSubCols)
+        : columns.slice(0, idx).concat(newSubCols, columns.slice(idx + 1));
+      const newRows = rows.map((r) => {
+        const parts = String(r[action.target] ?? '').split(p.delimiter);
+        const out = { ...r };
+        delete out[action.target];
+        keys.forEach((k, i) => { out[k] = (parts[i] ?? '').trim(); });
+        return out;
+      });
+      return { columns: newCols, rows: newRows };
+    }
+
+    case 'transformText': {
+      const op = p.op;
+      const newRows = rows.map((r) => {
+        const v = r[action.target];
+        if (v == null) return r;
+        let nv = String(v);
+        if (op === 'trim') nv = nv.trim();
+        else if (op === 'upper') nv = nv.toUpperCase();
+        else if (op === 'lower') nv = nv.toLowerCase();
+        else if (op === 'capitalize') nv = capitalizeWords(nv);
+        return { ...r, [action.target]: nv };
+      });
+      return { columns, rows: newRows };
+    }
+
+    case 'conditionalColumn': {
+      const newCol = { key: p.newKey, label: p.label, type: 'text' };
+      const newCols = columns.concat([newCol]);
+      const newRows = rows.map((r) => ({
+        ...r,
+        [p.newKey]: predicate(r[p.ifCol], p.op, p.value) ? p.thenValue : p.elseValue,
+      }));
+      return { columns: newCols, rows: newRows };
+    }
+
+    case 'appendQuery': {
+      const extra = (p.rows || []).map((r) => clone(r));
+      return { columns, rows: rows.concat(extra) };
+    }
+
+    case 'mergeQuery': {
+      const bring = p.bring || [];
+      const newCols = columns.concat(bring.map((b) => ({ key: b.key, label: b.label, type: 'text' })));
+      const newRows = rows.map((r) => {
+        const out = { ...r };
+        bring.forEach((b) => {
+          const lookup = b.lookup || {};
+          out[b.key] = lookup[String(r[p.keyCol] ?? '')] ?? '';
+        });
+        return out;
+      });
+      return { columns: newCols, rows: newRows };
+    }
+
+    default:
+      return { columns, rows };
+  }
+}
+
+// Rejoue tout l'historique d'actions sur les données brutes.
+function replay(raw, history) {
+  let columns = clone(raw.columns);
+  let rows = clone(raw.rows);
+  for (const action of history) {
+    const res = applyOne(columns, rows, action);
+    columns = res.columns;
+    rows = res.rows;
+  }
+  return { columns, rows };
+}
+
+// ---------- état de plus haut niveau (matérialisé + historique + étapes) ----------
+
+function initState(scenario) {
+  const raw = { columns: clone(scenario.columns), rows: clone(scenario.rows) };
+  return {
+    source: scenario.preSource || null,
+    raw,
+    history: [],
+    columns: clone(scenario.columns),
+    rows: clone(scenario.rows),
+    steps: [{ name: 'Source' }],
+    refreshedAt: 0,
+  };
+}
+
+function defaultStep(type) {
+  const map = {
+    promoteHeaders: 'En-têtes promus',
+    removeColumn: 'Colonnes supprimées',
+    removeBottomRows: 'Lignes du bas supprimées',
+    removeEmptyRows: 'Lignes vides supprimées',
+    changeType: 'Type modifié',
+    replaceValue: 'Valeur remplacée',
+    filterRows: 'Lignes filtrées',
+    splitColumn: 'Colonne fractionnée',
+    transformText: 'Texte transformé',
+    conditionalColumn: 'Colonne conditionnelle ajoutée',
+    appendQuery: 'Requêtes ajoutées',
+    mergeQuery: 'Requêtes fusionnées',
+  };
+  return map[type] || 'Étape';
+}
+
+function applyAction(state, action) {
+  if (action.type === 'renameStep') {
+    const i = action.params.stepIndex;
+    const steps = state.steps.map((s, k) => (k === i ? { ...s, name: action.params.newName } : s));
+    return { ...state, steps };
+  }
+
+  if (action.type === 'refresh') {
+    const newRows = (action.params && action.params.newRows) || [];
+    const raw = { columns: state.raw.columns, rows: state.raw.rows.concat(newRows.map((r) => clone(r))) };
+    const cur = replay(raw, state.history);
+    return { ...state, raw, columns: cur.columns, rows: cur.rows, refreshedAt: state.refreshedAt + 1 };
+  }
+
+  if (action.type === 'chooseSource') {
+    const history = state.history.concat([action]);
+    return { ...state, source: action.params.source, history };
+  }
+
+  const history = state.history.concat([action]);
+  const cur = replay(state.raw, history);
+  const stepName = action.stepLabel || defaultStep(action.type);
+  const steps = state.steps.concat([{ name: stepName }]);
+  return { ...state, history, columns: cur.columns, rows: cur.rows, steps };
+}
+
+// ---------- validation : l'action du participant correspond-elle à l'objectif ? ----------
+
+function matchAction(performed, expected) {
+  if (!performed || !expected || performed.type !== expected.type) return false;
+  const pp = performed.params || {};
+  const ep = expected.params || {};
+  switch (expected.type) {
+    case 'chooseSource': return pp.source === ep.source;
+    case 'promoteHeaders': return true;
+    case 'removeColumn': return performed.target === expected.target;
+    case 'removeBottomRows': return Number(pp.count || 1) === Number(ep.count || 1);
+    case 'removeEmptyRows': return true;
+    case 'changeType': return performed.target === expected.target && pp.toType === ep.toType;
+    case 'replaceValue':
+      return performed.target === expected.target && String(pp.from) === String(ep.from) && String(pp.to) === String(ep.to);
+    case 'filterRows':
+      return performed.target === expected.target && pp.op === ep.op && String(pp.value) === String(ep.value);
+    case 'splitColumn': return performed.target === expected.target && pp.delimiter === ep.delimiter;
+    case 'transformText': return performed.target === expected.target && pp.op === ep.op;
+    case 'conditionalColumn': return pp.newKey === ep.newKey && pp.ifCol === ep.ifCol;
+    case 'appendQuery': return true;
+    case 'mergeQuery': return pp.keyCol === ep.keyCol;
+    case 'refresh': return true;
+    case 'renameStep': return Number(pp.stepIndex) === Number(ep.stepIndex);
+    default: return false;
+  }
+}
+
+// Interface du simulateur Power Query — XGuard Academy
+// Couche d'affichage (DOM). S'appuie sur les fonctions pures de transforms.mjs
+// (initState, applyAction, matchAction, formatCell) qui sont concaténées avant ce
+// fichier au moment du build. SCENARIOS est injecté par le build.
+// Pas de dépendance externe, pas de police d'icônes : tout est en CSS.
+
+function pqxInit(root, scenarios) {
+  const C = {
+    green: '#217346', greenDark: '#1a5c38', bg: '#faf9f8', panel: '#f3f2f1',
+    border: '#e1dfdd', border2: '#c8c6c4', text: '#323130', muted: '#605e5c',
+    sel: '#c7e0d4', selBg: '#edf6f1', warn: '#8a6d00', warnBg: '#fff8e6',
+    ok: '#0b6a0b', okBg: '#e9f6e9', rec: '#d13438',
+  };
+  const style = document.createElement('style');
+  style.textContent = `
+  .pqx-app{font-family:system-ui,-apple-system,'Segoe UI',Roboto,sans-serif;color:${C.text};border:1px solid ${C.border2};border-radius:8px;overflow:hidden;background:#fff;max-width:1000px}
+  .pqx-top{border-top:3px solid ${C.green};background:${C.panel};border-bottom:1px solid ${C.border};padding:10px 14px;display:flex;align-items:center;gap:12px;flex-wrap:wrap}
+  .pqx-top b{font-weight:600}
+  .pqx-sel{font-size:13px;padding:6px 8px;border:1px solid ${C.border2};border-radius:6px;background:#fff;color:${C.text}}
+  .pqx-obj-sum{font-size:12.5px;color:${C.muted};flex:1;min-width:180px}
+  .pqx-tabs{display:flex;gap:18px;padding:6px 14px 0;background:#fff;border-bottom:1px solid ${C.border};font-size:13px}
+  .pqx-tabs span{padding:6px 2px;color:${C.muted}}
+  .pqx-tabs span.on{color:${C.text};border-bottom:2px solid ${C.green};font-weight:600}
+  .pqx-tools{position:relative;display:flex;gap:6px;padding:8px 14px;background:${C.bg};border-bottom:1px solid ${C.border};flex-wrap:wrap;align-items:center}
+  .pqx-btn{font-size:12px;padding:7px 10px;border:1px solid ${C.border2};border-radius:6px;background:#fff;cursor:pointer;color:${C.text};line-height:1.2}
+  .pqx-btn:hover{background:${C.panel}}
+  .pqx-btn:disabled{opacity:.45;cursor:default}
+  .pqx-selind{margin-left:auto;font-size:12px;color:${C.muted}}
+  .pqx-selind b{color:${C.text}}
+  .pqx-grpsep{width:1px;align-self:stretch;background:${C.border2};margin:0 4px}
+  .pqx-load{display:inline-flex;align-items:center;gap:6px;font-size:12px;padding:7px 11px;border:1px solid ${C.greenDark};border-radius:6px;background:${C.green};color:#fff;cursor:pointer;font-weight:500}
+  .pqx-fx{display:flex;align-items:center;gap:8px;padding:5px 14px;background:#fff;border-bottom:1px solid ${C.border};font-size:12px}
+  .pqx-fx .fxi{font-style:italic;font-weight:700;color:${C.greenDark};border:1px solid ${C.border2};border-radius:4px;padding:0 8px;line-height:18px}
+  .pqx-fx .fxv{flex:1;color:${C.text};white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+  .pqx-status{display:flex;gap:18px;padding:6px 14px;background:${C.panel};border-top:1px solid ${C.border};font-size:11.5px;color:${C.muted}}
+  .pqx-q .qcur{background:${C.green};color:#fff}
+  .pqx-menu{position:absolute;z-index:40;background:#fff;border:1px solid ${C.border2};border-radius:6px;box-shadow:0 4px 14px rgba(0,0,0,.12);min-width:210px;padding:4px}
+  .pqx-menu .mi{padding:8px 10px;border-radius:5px;font-size:13px;cursor:pointer}
+  .pqx-menu .mi:hover{background:${C.selBg}}
+  .pqx-body{display:grid;grid-template-columns:120px minmax(0,1fr) 210px}
+  .pqx-q{border-right:1px solid ${C.border};padding:10px 8px}
+  .pqx-q .h{font-size:11px;color:${C.muted};text-transform:uppercase;letter-spacing:.04em;margin-bottom:6px}
+  .pqx-q .item{display:flex;align-items:center;gap:6px;font-size:12.5px;padding:6px 7px;border-radius:5px;background:${C.selBg};color:${C.greenDark}}
+  .pqx-gridwrap{overflow-x:auto}
+  table.pqx-grid{border-collapse:collapse;width:100%;min-width:520px}
+  table.pqx-grid th{position:relative;text-align:left;font-weight:600;font-size:12px;padding:6px 10px;white-space:nowrap;border:1px solid ${C.border};background:${C.panel};cursor:pointer;user-select:none}
+  table.pqx-grid th.sel{background:${C.sel};outline:2px solid ${C.green};outline-offset:-2px}
+  table.pqx-grid th .ty{display:inline-block;min-width:24px;font-size:10.5px;color:${C.muted};font-weight:400}
+  table.pqx-grid td{font-size:12px;padding:5px 10px;white-space:nowrap;border:1px solid ${C.border}}
+  table.pqx-grid td.num{text-align:right;font-variant-numeric:tabular-nums}
+  table.pqx-grid tr.tot td{color:${C.muted};font-style:italic;background:${C.panel}}
+  .pqx-props{border-left:1px solid ${C.border};padding:10px 10px}
+  .pqx-props .h{font-size:11px;color:${C.muted};text-transform:uppercase;letter-spacing:.04em;margin:0 0 5px}
+  .pqx-props .nm{font-size:12.5px;color:${C.muted};margin-bottom:12px}
+  .pqx-props .nm b{color:${C.text}}
+  .pqx-step{display:flex;align-items:center;gap:7px;font-size:12px;padding:5px 8px;border-radius:5px;border:1px solid ${C.border};margin-bottom:3px}
+  .pqx-step.cur{background:${C.selBg};border-color:${C.sel}}
+  .pqx-step .dot{width:7px;height:7px;border-radius:50%;background:${C.green};flex:none}
+  .pqx-coach{padding:12px 14px;border-top:1px solid ${C.border};background:${C.panel}}
+  .pqx-chips{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:9px}
+  .pqx-chip{display:inline-flex;align-items:center;gap:6px;font-size:12px;padding:4px 10px;border-radius:999px;border:1px solid ${C.border2};color:${C.muted}}
+  .pqx-chip.done{background:${C.okBg};color:${C.ok};border-color:${C.okBg}}
+  .pqx-chip .mark{font-weight:700}
+  .pqx-msg{font-size:13px;color:${C.muted};min-height:20px;line-height:1.5}
+  .pqx-actions{display:flex;gap:8px;margin-top:11px;flex-wrap:wrap}
+  .pqx-act{font-size:12.5px;padding:8px 13px;border:1px solid ${C.border2};border-radius:6px;background:#fff;cursor:pointer;color:${C.text}}
+  .pqx-act:hover{background:${C.bg}}
+  .pqx-act.primary{border-color:${C.green};color:${C.greenDark}}
+  .pqx-dlg input{font-size:13px;padding:6px 8px;border:1px solid ${C.border2};border-radius:5px}
+  `;
+  root.appendChild(style);
+  const app = document.createElement('div');
+  app.className = 'pqx-app';
+  root.appendChild(app);
+
+  // ---- état runtime ----
+  let scIndex = 0;
+  let st = null;
+  let completed = 0;
+  let sel = null;
+  let playing = false;
+  let shotMode = false;  // mode capture d'écran (cache la barre pédagogique → look Excel pur)
+
+  const NEEDS_COL = new Set(['removeColumn', 'changeType', 'replaceValue', 'filterRows', 'splitColumn', 'transformText']);
+  const BTN = {
+    chooseSource: 'Choisir la source ▾', promoteHeaders: 'Utiliser la 1re ligne comme en-têtes',
+    removeColumn: 'Supprimer les colonnes', removeBottomRows: 'Supprimer les lignes du bas',
+    removeEmptyRows: 'Supprimer les lignes vides', changeType: 'Type de données ▾',
+    replaceValue: 'Remplacer les valeurs', filterRows: 'Filtrer la colonne',
+    splitColumn: 'Fractionner la colonne', transformText: 'Format du texte ▾',
+    conditionalColumn: 'Colonne conditionnelle', appendQuery: 'Ajouter (empiler)',
+    mergeQuery: 'Fusionner les requêtes', refresh: 'Actualiser', renameStep: 'Renommer l\'étape',
+  };
+  const TYPE_MENU = [
+    { label: 'Texte', value: 'text' }, { label: 'Nombre entier', value: 'integer' },
+    { label: 'Nombre décimal', value: 'decimal' }, { label: 'Date', value: 'date' },
+  ];
+  const TEXT_MENU = [
+    { label: 'Supprimer les espaces', value: 'trim' }, { label: 'MAJUSCULES', value: 'upper' },
+    { label: 'minuscules', value: 'lower' }, { label: 'Majuscule à chaque mot', value: 'capitalize' },
+  ];
+  const SOURCE_MENU = [
+    { label: 'Classeur Excel', value: 'excel' }, { label: 'Fichier texte / CSV', value: 'csv' },
+    { label: 'Dossier', value: 'dossier' },
+  ];
+
+  function curObj() { const o = st.scenarioObjectives; return completed < o.length ? o[completed] : null; }
+  function labelOf(key) { const c = st.columns.find((c) => c.key === key); return c ? c.label : key; }
+  function ribbonTypes() {
+    const seen = []; for (const o of st.scenarioObjectives) if (!seen.includes(o.action.type)) seen.push(o.action.type);
+    return seen;
+  }
+
+  function loadScenario(i) {
+    scIndex = i;
+    const s = scenarios[i].scenario;
+    st = initState(s);
+    st.scenarioObjectives = s.objectives;
+    completed = 0; sel = null; playing = false;
+    closeMenus();
+    render();
+    coachHint();
+    renderActions();
+  }
+
+  function render() {
+    const numericTypes = new Set(['decimal', 'integer']);
+    const selOptions = scenarios.map((s, i) => `<option value="${i}"${i === scIndex ? ' selected' : ''}>Leçon ${s.lessonIndex} — ${esc(s.title)}</option>`).join('');
+    const tools = ribbonTypes().map((t) => `<button class="pqx-btn" data-act="${t}">${BTN[t]}</button>`).join('');
+    const head = st.columns.map((c) => {
+      const on = sel === c.key;
+      const ty = c.type === 'decimal' ? '1.2' : c.type === 'integer' ? '123' : c.type === 'date' ? '📅' : 'ABC';
+      return `<th data-k="${c.key}"${on ? ' class="sel"' : ''}><span class="ty">${ty}</span>${esc(c.label)}</th>`;
+    }).join('');
+    const body = st.rows.map((r) => {
+      const tot = r.total ? ' class="tot"' : '';
+      const tds = st.columns.map((c) => {
+        const num = numericTypes.has(c.type);
+        return `<td${num ? ' class="num"' : ''}>${esc(formatCell(r[c.key], c.type))}</td>`;
+      }).join('');
+      return `<tr${tot}>${tds}</tr>`;
+    }).join('');
+    const steps = st.steps.map((s, i) => `<div class="pqx-step${i === st.steps.length - 1 ? ' cur' : ''}"><span class="dot"></span>${esc(s.name)}</div>`).join('');
+    const chips = st.scenarioObjectives.map((o, i) => `<span class="pqx-chip${i < completed ? ' done' : ''}"><span class="mark">${i < completed ? '✓' : '○'}</span>${esc(o.label)}</span>`).join('');
+    const sc = scenarios[scIndex];
+
+    app.innerHTML = `
+    <div class="pqx-top">
+      <b style="color:${C.greenDark}">Éditeur Power Query</b>
+      <select class="pqx-sel" id="pqx-lesson">${selOptions}</select>
+      <span class="pqx-obj-sum">${esc(sc.summary || '')}</span>
+    </div>
+    <div class="pqx-tabs"><span class="on">Accueil</span><span>Transformer</span><span>Ajouter une colonne</span><span>Affichage</span></div>
+    <div class="pqx-tools" id="pqx-tools"><button class="pqx-load">▣ Fermer et charger</button><span class="pqx-grpsep"></span>${tools}<span class="pqx-selind">Colonne sélectionnée : <b id="pqx-selname">${sel ? esc(labelOf(sel)) : '—'}</b></span></div>
+    <div class="pqx-fx"><span class="fxi">fx</span><span class="fxv">= ${esc(st.steps.length ? st.steps[st.steps.length - 1].name : 'Source')}</span></div>
+    <div class="pqx-body">
+      <div class="pqx-q"><div class="h">Requêtes [1]</div><div class="item qcur">▦ ${esc(scenarios[scIndex].scenario.queryName)}</div></div>
+      <div class="pqx-gridwrap"><table class="pqx-grid"><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table></div>
+      <div class="pqx-props"><div class="h">Propriétés</div><div class="nm">Nom : <b>${esc(scenarios[scIndex].scenario.queryName)}</b></div><div class="h">Étapes appliquées</div>${steps}</div>
+    </div>
+    <div class="pqx-status"><span>${st.columns.length} colonnes, ${st.rows.length} lignes</span><span>${st.steps.length} étape(s) appliquée(s)</span><span style="margin-left:auto">Aperçu — données fictives XGuard</span></div>
+    ${shotMode ? '' : `<div class="pqx-coach">
+      <div class="pqx-chips">${chips}</div>
+      <div class="pqx-msg" id="pqx-msg"></div>
+      <div class="pqx-actions" id="pqx-actions"></div>
+    </div>`}`;
+
+    app.querySelector('#pqx-lesson').onchange = (e) => loadScenario(Number(e.target.value));
+    app.querySelectorAll('table.pqx-grid th').forEach((th) => { th.onclick = () => { if (!playing) { sel = th.getAttribute('data-k'); render(); coachHint(); renderActions(); } }; });
+    app.querySelectorAll('#pqx-tools .pqx-btn').forEach((b) => { b.onclick = () => onCommand(b.getAttribute('act') || b.getAttribute('data-act'), b); });
+  }
+
+  function esc(s) { return String(s == null ? '' : s).replace(/[&<>"]/g, (m) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[m])); }
+  function msg(html) { const m = app.querySelector('#pqx-msg'); if (m) m.innerHTML = html; }
+  function coachHint() {
+    const o = curObj();
+    if (!o) { success(); return; }
+    msg(`<span style="color:${C.text}"><b>Objectif :</b> ${esc(o.hint)}</span>`);
+  }
+  function warn(t) { msg(`<span style="color:${C.warn}">⚠ ${esc(t)}</span>`); }
+
+  function renderActions(done) {
+    const a = app.querySelector('#pqx-actions'); if (!a) return;
+    let html = '<button class="pqx-act" id="pqx-demo">▶ Mode démo (joue tout seul)</button><button class="pqx-act" id="pqx-reset">↺ Recommencer</button>';
+    if (done) html += '<button class="pqx-act primary" id="pqx-video">Comment ça devient une vidéo ?</button>';
+    a.innerHTML = html;
+    a.querySelector('#pqx-demo').onclick = autoPlay;
+    a.querySelector('#pqx-reset').onclick = () => loadScenario(scIndex);
+    if (done && a.querySelector('#pqx-video')) a.querySelector('#pqx-video').onclick = () => { if (typeof sendPrompt === 'function') sendPrompt('Explique comment cette simulation auto-jouée devient la vidéo de démo narrée.'); };
+  }
+
+  function onCommand(type, btn) {
+    if (playing) return;
+    closeMenus();
+    const o = curObj();
+    if (!o) return;
+    // commandes à menu
+    if (type === 'changeType') { needColThen(o, type, () => openMenu(btn, TYPE_MENU, (v) => pick(o, type, { toType: v }, v === o.action.params.toType, 'Choisis « Nombre décimal » pour un montant, ou le bon type attendu.'))); return; }
+    if (type === 'transformText') { needColThen(o, type, () => openMenu(btn, TEXT_MENU, (v) => pick(o, type, { op: v }, v === o.action.params.op, 'Ce n\'est pas la mise en forme attendue ici.'))); return; }
+    if (type === 'chooseSource') { openMenu(btn, SOURCE_MENU, (v) => pick(o, type, { source: v }, type === o.action.type && v === o.action.params.source, 'Ce n\'est pas la bonne source pour ce fichier.')); return; }
+    // commandes directes
+    if (type !== o.action.type) { warn('Ce n\'est pas l\'étape attendue maintenant. ' + o.hint); return; }
+    if (NEEDS_COL.has(type)) {
+      if (sel !== o.action.target) { warn('Sélectionne d\'abord la colonne « ' + labelOf(o.action.target) + ' » en cliquant son en-tête.'); return; }
+    }
+    apply(o);
+  }
+
+  function needColThen(o, type, fn) {
+    if (type !== o.action.type) { warn('Ce n\'est pas l\'étape attendue maintenant. ' + o.hint); return; }
+    if (NEEDS_COL.has(type) && sel !== o.action.target) { warn('Sélectionne d\'abord la colonne « ' + labelOf(o.action.target) + ' » en cliquant son en-tête.'); return; }
+    fn();
+  }
+  function pick(o, type, params, okMatch, badMsg) {
+    closeMenus();
+    if (type !== o.action.type) { warn('Ce n\'est pas l\'étape attendue maintenant. ' + o.hint); return; }
+    if (!okMatch) { warn(badMsg); return; }
+    apply(o);
+  }
+
+  function apply(o) {
+    const performed = Object.assign({}, o.action, { stepLabel: o.stepLabel });
+    if (!matchAction(performed, o.action)) { warn('Action incohérente.'); return; }
+    st0apply(performed);
+    completed += 1; sel = null;
+    render();
+    if (!curObj()) success(); else { coachHint(); renderActions(); }
+  }
+  function st0apply(performed) {
+    const objs = st.scenarioObjectives;
+    st = applyAction(st, performed);
+    st.scenarioObjectives = objs;
+  }
+
+  function success() {
+    render();
+    msg(`<span style="color:${C.ok}"><b>✓ Bravo.</b> Données prêtes. Ces ${st.scenarioObjectives.length} étapes, jouées toutes seules, deviennent la vidéo de démo narrée — et elles se rejoueront sur les données du mois prochain en un clic.</span>`);
+    renderActions(true);
+    const id = scenarios[scIndex].lessonId, idx = scenarios[scIndex].lessonIndex;
+    try { if (typeof window !== 'undefined' && typeof window.onPqxComplete === 'function') window.onPqxComplete(id, idx); } catch (e) {}
+    try { if (typeof window !== 'undefined' && window.parent) window.parent.postMessage({ type: 'pqx-lesson-complete', lessonId: id, lessonIndex: idx }, '*'); } catch (e) {}
+  }
+
+  // ---- menus ----
+  function closeMenus() { app.querySelectorAll('.pqx-menu').forEach((m) => m.remove()); }
+  function openMenu(btn, items, onPick) {
+    closeMenus();
+    const tools = app.querySelector('#pqx-tools');
+    const d = document.createElement('div'); d.className = 'pqx-menu';
+    d.style.left = btn.offsetLeft + 'px'; d.style.top = (btn.offsetTop + btn.offsetHeight + 4) + 'px';
+    items.forEach((it) => { const e = document.createElement('div'); e.className = 'mi'; e.textContent = it.label; e.onclick = (ev) => { ev.stopPropagation(); onPick(it.value); }; d.appendChild(e); });
+    tools.appendChild(d);
+  }
+  app.addEventListener('click', (e) => { if (!e.target.closest('.pqx-menu') && !e.target.closest('.pqx-btn')) closeMenus(); });
+
+  // ---- mode démo (auto-play) ----
+  function autoPlay() {
+    loadScenario(scIndex); playing = true; closeMenus(); renderActions();
+    const objs = st.scenarioObjectives; let i = 0;
+    function tick() {
+      if (i >= objs.length) { playing = false; success(); return; }
+      const o = objs[i++];
+      if (NEEDS_COL.has(o.action.type)) { sel = o.action.target; render(); }
+      msg(`<span style="color:${C.text}"><span style="color:${C.rec}">●</span> ${esc(o.demoCaption)}</span>`);
+      setTimeout(() => { st0apply(Object.assign({}, o.action, { stepLabel: o.stepLabel })); completed = i; sel = null; render(); msg(`<span style="color:${C.text}"><span style="color:${C.rec}">●</span> ${esc(o.demoCaption)}</span>`); setTimeout(tick, 800); }, 1100);
+    }
+    tick();
+  }
+
+  // Lien profond : ?lecon=2.1 (ou l'identifiant de leçon) pré-sélectionne la leçon — utile pour
+  // pointer une leçon précise depuis GoHighLevel.
+  let startIdx = 0, shotSteps = 0;
+  try {
+    const q = new URLSearchParams(typeof location !== 'undefined' ? location.search : '');
+    const lec = q.get('lecon');
+    if (lec) { const k = scenarios.findIndex((s) => s.lessonIndex === lec || s.lessonId === lec); if (k >= 0) startIdx = k; }
+    shotMode = q.get('shot') === '1';
+    shotSteps = Math.max(0, parseInt(q.get('steps') || '0', 10) || 0);
+  } catch (e) {}
+  loadScenario(startIdx);
+  // Mode capture : applique les N premières étapes immédiatement et sélectionne la colonne
+  // de la prochaine étape, pour photographier l'éditeur à chaque stade de la transformation.
+  if (shotSteps > 0) {
+    const objs = st.scenarioObjectives;
+    for (let i = 0; i < shotSteps && i < objs.length; i++) st0apply(Object.assign({}, objs[i].action, { stepLabel: objs[i].stepLabel }));
+    completed = Math.min(shotSteps, objs.length);
+    const nextO = completed < objs.length ? objs[completed] : null;
+    if (nextO && NEEDS_COL.has(nextO.action.type)) sel = nextO.action.target;
+    render();
+  }
+}
+
+// Cockpit de révision pour cours interactif — XGuard Academy
+// S'appuie sur transforms.mjs (auto-test) et pqxInit (app.js, simulation jouable),
+// concaténés avant ce fichier au build. REVIEW_DATA est injecté par build-review.mjs.
+// Trois surfaces de révision par leçon : le script (narration), la simulation (à ESSAYER)
+// avec auto-test, et le quiz. Signalements typés + verdict 3 états + export JSON
+// (le format est prêt à pousser dans une table Supabase, comme la revue voix/vidéo).
+
+// Taxonomie de signalement (issue de la recherche QA e-learning interactif).
+// route = 'contenu' (repart vers la régénération de script/données/quiz) ou
+//         'code' (revient au code de la simulation — aucune régénération ne le corrige).
+const REVIEW_TAGS = [
+  { key: 'validation-trop-permissive', label: 'Validation TROP permissive (mauvais geste accepté) — critique', route: 'code' },
+  { key: 'validation-ne-declenche-pas', label: 'Le bon geste ne valide pas (faux négatif)', route: 'code' },
+  { key: 'cul-de-sac', label: 'Cul-de-sac (on reste bloqué, pas de reset)', route: 'code' },
+  { key: 'reset-rejeu-casse', label: 'Reset / rejeu cassé', route: 'code' },
+  { key: 'etat-systeme-manquant', label: 'État/progression pas visible', route: 'code' },
+  { key: 'compat-navigateur', label: 'Bug navigateur / mobile', route: 'code' },
+  { key: 'accessibilite', label: 'Accessibilité (clavier, contraste)', route: 'code' },
+  { key: 'decalage-narration-sim', label: 'Décalage narration ↔ simulation (libellé/emplacement)', route: 'contenu' },
+  { key: 'indice-ambigu', label: 'Indice ambigu ou trompeur', route: 'contenu' },
+  { key: 'indice-donne-reponse', label: 'Indice qui donne la réponse', route: 'contenu' },
+  { key: 'donnees-irrealistes', label: 'Données irréalistes / pas québécoises', route: 'contenu' },
+  { key: 'francais-a-revoir', label: 'Français à revoir (anglicisme, formulation)', route: 'contenu' },
+  { key: 'quiz-mauvaise-cle', label: 'Quiz : mauvaise clé ou hors-matière', route: 'contenu' },
+];
+
+function reviewInit(root, lessons) {
+  const C = { green: '#217346', greenD: '#1a5c38', bg: '#faf9f8', panel: '#f3f2f1', border: '#e1dfdd', border2: '#c8c6c4', text: '#323130', muted: '#605e5c', amber: '#8a6d00', amberBg: '#fff3cd', red: '#a4262c', redBg: '#fde7e9', ok: '#0b6a0b', okBg: '#dff6dd' };
+  const VERDICTS = { 'a-reviser': { label: 'À réviser', bg: C.panel, fg: C.muted }, 'a-corriger': { label: 'À corriger', bg: C.amberBg, fg: C.amber }, 'a-jour': { label: 'À jour', bg: C.okBg, fg: C.ok } };
+
+  const reviews = {};
+  lessons.forEach((l) => { reviews[l.id] = { verdict: 'a-reviser', tags: [], note: '' }; });
+  let cur = 0;
+
+  const style = document.createElement('style');
+  style.textContent = `
+  .rv{font-family:system-ui,-apple-system,'Segoe UI',Roboto,sans-serif;color:${C.text}}
+  .rv-grid{display:grid;grid-template-columns:230px minmax(0,1fr);gap:14px}
+  .rv-list{border:1px solid ${C.border2};border-radius:8px;overflow:hidden;align-self:start}
+  .rv-li{padding:9px 11px;border-bottom:1px solid ${C.border};cursor:pointer;font-size:13px;display:flex;justify-content:space-between;align-items:center;gap:8px}
+  .rv-li:hover{background:${C.bg}}
+  .rv-li.on{background:${C.panel};font-weight:600}
+  .rv-bdg{font-size:10.5px;padding:2px 7px;border-radius:999px;white-space:nowrap}
+  .rv-card{border:1px solid ${C.border2};border-radius:8px;overflow:hidden}
+  .rv-hd{background:${C.panel};border-bottom:1px solid ${C.border};padding:11px 14px}
+  .rv-hd h3{margin:0;font-size:15px;font-weight:600}
+  .rv-hd .sub{font-size:12.5px;color:${C.muted};margin-top:2px}
+  .rv-sec{border-bottom:1px solid ${C.border};padding:12px 14px}
+  .rv-sec h4{margin:0 0 8px;font-size:12px;text-transform:uppercase;letter-spacing:.04em;color:${C.muted}}
+  .rv-script{white-space:pre-wrap;font-size:12.5px;line-height:1.55;max-height:230px;overflow:auto;background:${C.bg};border:1px solid ${C.border};border-radius:6px;padding:10px}
+  .rv-at{font-size:12.5px;border:1px solid ${C.border};border-radius:6px;overflow:hidden;margin-top:8px}
+  .rv-at .row{display:flex;gap:8px;padding:5px 9px;border-bottom:1px solid ${C.border}}
+  .rv-at .row:last-child{border-bottom:0}
+  .rv-tbl{border-collapse:collapse;font-size:11.5px;margin-top:8px}
+  .rv-tbl th,.rv-tbl td{border:1px solid ${C.border};padding:3px 7px;white-space:nowrap}
+  .rv-tbl th{background:${C.panel}}
+  .rv-tags{display:grid;grid-template-columns:1fr 1fr;gap:6px}
+  .rv-tag{display:flex;gap:7px;align-items:center;font-size:12.5px;padding:5px 8px;border:1px solid ${C.border};border-radius:6px;cursor:pointer}
+  .rv-tag.on{background:${C.amberBg};border-color:${C.amber};color:${C.amber}}
+  .rv-note{width:100%;min-height:54px;font-size:13px;border:1px solid ${C.border2};border-radius:6px;padding:8px;font-family:inherit;box-sizing:border-box;margin-top:8px}
+  .rv-vbtns{display:flex;gap:8px;flex-wrap:wrap}
+  .rv-v{font-size:12.5px;padding:7px 12px;border:1px solid ${C.border2};border-radius:6px;background:#fff;cursor:pointer}
+  .rv-v.sel{border-width:2px}
+  .rv-foot{display:flex;justify-content:space-between;align-items:center;margin-top:12px;gap:10px;flex-wrap:wrap}
+  .rv-exp{font-size:13px;padding:9px 14px;border:1px solid ${C.green};color:${C.greenD};background:#fff;border-radius:6px;cursor:pointer}
+  .rv-q{font-size:12.5px;margin-bottom:8px}
+  .rv-q .opt{color:${C.muted}}
+  .rv-q .good{color:${C.ok};font-weight:600}
+  .rv-quiet{font-size:12px;color:${C.muted}}
+  `;
+  root.appendChild(style);
+  const wrap = document.createElement('div'); wrap.className = 'rv'; root.appendChild(wrap);
+
+  function esc(s) { return String(s == null ? '' : s).replace(/[&<>"]/g, (m) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[m])); }
+
+  function autotest(scenario) {
+    let st = initState(scenario); st.scenarioObjectives = scenario.objectives;
+    const steps = [];
+    for (const o of scenario.objectives) {
+      let ok = true; try { st = applyAction(st, Object.assign({}, o.action, { stepLabel: o.stepLabel })); } catch (e) { ok = false; }
+      steps.push({ label: o.label, ok });
+    }
+    return { steps, columns: st.columns, rows: st.rows };
+  }
+
+  function render() {
+    const counts = lessons.reduce((a, l) => { a[reviews[l.id].verdict]++; return a; }, { 'a-reviser': 0, 'a-corriger': 0, 'a-jour': 0 });
+    const list = lessons.map((l, i) => {
+      const v = VERDICTS[reviews[l.id].verdict];
+      return `<div class="rv-li${i === cur ? ' on' : ''}" data-i="${i}"><span>Leçon ${l.idx}<br><span class="rv-quiet">${esc(l.title)}</span></span><span class="rv-bdg" style="background:${v.bg};color:${v.fg}">${v.label}</span></div>`;
+    }).join('');
+    wrap.innerHTML = `
+    <div style="margin-bottom:12px">
+      <h2 style="margin:0;font-size:18px;font-weight:600">Revue — cours interactif Excel Power Query</h2>
+      <div class="rv-quiet" style="margin-top:3px">À jour : ${counts['a-jour']} · À corriger : ${counts['a-corriger']} · À réviser : ${counts['a-reviser']} / ${lessons.length} leçons</div>
+    </div>
+    <div class="rv-grid">
+      <div class="rv-list" id="rv-list">${list}</div>
+      <div id="rv-detail"></div>
+    </div>
+    <div class="rv-foot">
+      <span class="rv-quiet">Le réviseur ESSAIE chaque simulation, lit le script, vérifie le quiz, puis signale et tranche le verdict.</span>
+      <button class="rv-exp" id="rv-export">Exporter la revue (JSON)</button>
+    </div>`;
+    wrap.querySelectorAll('.rv-li').forEach((el) => { el.onclick = () => { cur = Number(el.getAttribute('data-i')); render(); }; });
+    wrap.querySelector('#rv-export').onclick = exportReview;
+    renderDetail();
+  }
+
+  function renderDetail() {
+    const l = lessons[cur]; const det = wrap.querySelector('#rv-detail'); const r = reviews[l.id];
+    const quiz = (l.quiz || []).map((q, i) => `<div class="rv-q">${i + 1}. ${esc(q.question)}<br>${q.options.map((o, k) => `<span class="${k === q.correctIndex ? 'good' : 'opt'}">${'abcd'[k]}) ${esc(o)}</span>`).join(' &nbsp; ')}</div>`).join('');
+    const files = (l.downloadableFiles || []).map((f) => `<div class="rv-quiet">📎 ${esc(f.filename)} — ${esc(f.description)}</div>`).join('') || '<div class="rv-quiet">aucun</div>';
+    const tags = REVIEW_TAGS.map((t) => `<label class="rv-tag${r.tags.includes(t.key) ? ' on' : ''}" data-tag="${t.key}"><input type="checkbox" ${r.tags.includes(t.key) ? 'checked' : ''}> ${t.label}</label>`).join('');
+    const vb = Object.keys(VERDICTS).map((k) => `<button class="rv-v${r.verdict === k ? ' sel' : ''}" data-v="${k}" style="${r.verdict === k ? 'border-color:' + VERDICTS[k].fg + ';color:' + VERDICTS[k].fg : ''}">${VERDICTS[k].label}</button>`).join('');
+
+    det.innerHTML = `
+    <div class="rv-card">
+      <div class="rv-hd"><h3>Leçon ${l.idx} — ${esc(l.title)}</h3><div class="sub">${l.scenario ? 'Simulation interactive' : 'Concept (pas de simulation)'} · ${Math.round(l.durationSeconds / 60)} min · ${esc(l.summary)}</div></div>
+      <div class="rv-sec"><h4>1. Script (narration)</h4><div class="rv-script">${esc(l.narration)}</div></div>
+      ${l.scenario ? `<div class="rv-sec"><h4>2. Simulation — essaie-le</h4><div id="rv-sim"></div><div id="rv-autotest"></div></div>` : ''}
+      <div class="rv-sec"><h4>${l.scenario ? '3' : '2'}. Quiz</h4>${quiz || '<div class="rv-quiet">aucun</div>'}</div>
+      <div class="rv-sec"><h4>Fichiers d'exercice</h4>${files}</div>
+      <div class="rv-sec"><h4>Signalements</h4><div class="rv-tags">${tags}</div><textarea class="rv-note" id="rv-note" placeholder="Note libre du réviseur (ex. « l'indice de l'étape 3 ne dit pas quelle colonne »)">${esc(r.note)}</textarea></div>
+      <div class="rv-sec"><h4>Verdict</h4><div class="rv-vbtns">${vb}</div></div>
+    </div>`;
+
+    det.querySelectorAll('.rv-tag').forEach((el) => { el.onclick = (e) => { if (e.target.tagName === 'INPUT') return; const k = el.getAttribute('data-tag'); toggleTag(l.id, k); }; el.querySelector('input').onchange = () => toggleTag(l.id, el.getAttribute('data-tag')); });
+    det.querySelector('#rv-note').oninput = (e) => { r.note = e.target.value; };
+    det.querySelectorAll('.rv-v').forEach((el) => { el.onclick = () => { r.verdict = el.getAttribute('data-v'); render(); }; });
+
+    if (l.scenario) {
+      const simRoot = det.querySelector('#rv-sim'); simRoot.innerHTML = '';
+      pqxInit(simRoot, [{ lessonId: l.id, lessonIndex: l.idx, title: l.title, summary: l.summary, scenario: l.scenario }]);
+      const at = autotest(l.scenario);
+      const allOk = at.steps.every((s) => s.ok);
+      const head = at.columns.map((c) => `<th>${esc(c.label)}</th>`).join('');
+      const body = at.rows.slice(0, 6).map((rw) => `<tr>${at.columns.map((c) => `<td>${esc(formatCell(rw[c.key], c.type))}</td>`).join('')}</tr>`).join('');
+      det.querySelector('#rv-autotest').innerHTML = `
+        <div class="rv-at">
+          <div class="row" style="font-weight:600;background:${allOk ? C.okBg : C.redBg};color:${allOk ? C.ok : C.red}">Auto-test du scénario : ${allOk ? 'toutes les étapes s\'appliquent ✓' : 'PROBLÈME — une étape échoue'}</div>
+          ${at.steps.map((s, i) => `<div class="row"><span>${s.ok ? '✓' : '✗'}</span><span>Étape ${i + 1} — ${esc(s.label)}</span></div>`).join('')}
+        </div>
+        <div class="rv-quiet" style="margin-top:8px">Résultat attendu après les ${at.steps.length} étapes (${at.rows.length} lignes) :</div>
+        <table class="rv-tbl"><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table>`;
+    }
+  }
+
+  function toggleTag(id, key) {
+    const t = reviews[id].tags; const i = t.indexOf(key);
+    if (i >= 0) t.splice(i, 1); else t.push(key);
+    renderDetail();
+  }
+
+  function exportReview() {
+    const out = {
+      course: 'excel-power-query',
+      reviewedAt: new Date().toISOString(),
+      lessons: lessons.map((l) => ({
+        id: l.id, lessonIndex: l.idx, title: l.title, verdict: reviews[l.id].verdict,
+        flags: reviews[l.id].tags.map((k) => { const t = REVIEW_TAGS.find((x) => x.key === k) || {}; return { key: k, route: t.route || 'contenu' }; }),
+        note: reviews[l.id].note,
+      })),
+    };
+    const blob = new Blob([JSON.stringify(out, null, 2)], { type: 'application/json' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob); a.download = 'revue-excel-power-query.json';
+    document.body.appendChild(a); a.click(); a.remove();
+  }
+
+  render();
+}
+
+var REVIEW_DATA = [{"id":"00-pourquoi-power-query","idx":"0.1","title":"Pourquoi Power Query","durationSeconds":150,"summary":"Comprendre le problème du nettoyage manuel répété et voir comment Power Query enregistre les étapes une fois pour les rejouer automatiquement chaque mois.","narration":"[SCENE 1 — LE PROBLÈME | 0s-30s]\nChaque mois, c'est le même travail. Vous ouvrez le rapport de ventes de formations, et vous recommencez à zéro. [pause 600ms] Vous copiez-collez des lignes, vous supprimez les colonnes inutiles, vous corrigez les formats de montants, vous enlevez la ligne de total au bas. [pause 400ms] Trente minutes, parfois plus. Et chaque manipulation à la main, c'est une chance de plus de se tromper.\n\n[SCENE 2 — LA VRAIE QUESTION | 30s-55s]\nPosez-vous une question simple. [pause 400ms] Si le nettoyage est exactement le même d'un mois à l'autre, pourquoi le refaire à la main à chaque fois? [pause 600ms] Le travail change pas. Seules les données changent. C'est précisément ce que Power Query règle.\n\n[SCENE 3 — LA PROMESSE | 55s-90s]\nPower Query, c'est un atelier de transformation intégré à Excel. [pause 400ms] Vous nettoyez votre fichier une seule fois, et pendant que vous travaillez, Power Query enregistre chacun de vos gestes. [pause 600ms] Supprimer une colonne, corriger un format, filtrer des lignes : chaque geste devient une étape mémorisée. [pause 400ms] Le mois suivant, vous déposez les nouvelles données, vous cliquez sur Actualiser, et toutes vos étapes se rejouent toutes seules, dans le même ordre. Le rapport est prêt.\n\n[SCENE 4 — OÙ ÇA VIT DANS EXCEL | 90s-115s]\nOù trouver tout ça? [pause 400ms] Dans le ruban d'Excel, vous allez sur l'onglet Données. Vous y voyez deux portes d'entrée : Obtenir des données, pour aller chercher votre fichier, et Transformer les données, pour ouvrir l'éditeur. [pause 600ms] C'est dans cet éditeur que toute la magie se passe.\n\n[SCENE 5 — LE VOCABULAIRE | 115s-140s]\nTrois mots à retenir pour la suite. [pause 400ms] La requête : c'est votre recette de nettoyage au complet. [pause 400ms] Les étapes appliquées : c'est la liste de vos gestes, à droite de l'écran, que vous pouvez relire et modifier en tout temps. [pause 400ms] Et actualiser : c'est le bouton qui rejoue toute la recette sur les nouvelles données.\n\n[SCENE 6 — EXEMPLE XGUARD | 140s-150s]\nConcrètement, pour XGuard : votre rapport mensuel des ventes de formations en gardiennage, nettoyé une fois, se régénère en un clic chaque mois. [pause 400ms] On commence.","productionNotes":"Ton : formateur calme, posé, rassurant. Rythme lent à modéré, on laisse respirer les pauses. C'est une leçon de concept, pas de manipulation; aucune capture d'écran de simulation, donc on s'appuie sur des visuels illustratifs.\n\nÉcran scène 1 : montrer une personne fictive (ou main animée) qui répète des gestes manuels sur un fichier Excel chargé, avec une horloge qui tourne et un petit symbole d'erreur rouge qui apparaît. Insister visuellement sur la répétition et la fatigue.\nÉcran scène 2 : ralentir, plein écran sur la question affichée en texte. Fond sobre, une seule idée à l'écran.\nÉcran scène 3 : animation clé de la leçon. Montrer un fichier qui se fait nettoyer, et à droite une liste d'étapes qui s'empile (Supprimer colonne, Modifier type, Filtrer lignes) au fur et à mesure que la narration les nomme. Puis un nouveau fichier déposé + bouton Actualiser pressé + les étapes qui se rejouent en cascade. C'est le moment qui doit rester en tête.\nÉcran scène 4 : capture annotée du ruban Excel, onglet Données surligné, avec deux flèches pointant Obtenir des données et Transformer les données.\nÉcran scène 5 : trois cartouches qui apparaissent un à un, synchronisés avec la narration : Requête, Étapes appliquées (avec un zoom sur le volet de droite de l'éditeur), Actualiser (avec l'icône du bouton).\nÉcran scène 6 : mockup d'un rapport XGuard intitulé Ventes de formations gardiennage — juin 2026, puis transition rapide vers le mois suivant régénéré en un clic. Terminer sur le titre du cours.\n\nSous-titres : activer, lecture facile. Aucun anglicisme à l'écran non plus (Données, Obtenir des données, Transformer les données, Actualiser — termes francophones du ruban Excel FR).","quiz":[{"question":"Quel est le principal avantage de Power Query par rapport au nettoyage manuel répété chaque mois?","options":["Il remplace complètement Excel par un autre logiciel","Il enregistre les étapes une fois, puis les rejoue sur les nouvelles données quand on actualise","Il corrige automatiquement les fautes d'orthographe dans les rapports","Il envoie le rapport par courriel aux gestionnaires"],"correctIndex":1,"explanation":"Power Query mémorise chaque geste de nettoyage sous forme d'étapes. Le mois suivant, on dépose les nouvelles données et on clique Actualiser : toutes les étapes se rejouent automatiquement, dans le même ordre."},{"question":"Dans Excel, par quel onglet du ruban accède-t-on à Power Query?","options":["L'onglet Accueil","L'onglet Insertion","L'onglet Données, via Obtenir des données ou Transformer les données","L'onglet Affichage"],"correctIndex":2,"explanation":"C'est l'onglet Données qui contient les portes d'entrée de Power Query : Obtenir des données pour aller chercher le fichier, et Transformer les données pour ouvrir l'éditeur."},{"question":"Dans le vocabulaire de Power Query, que représente la liste des étapes appliquées?","options":["La liste de vos gestes de nettoyage, à droite de l'écran, qu'on peut relire et modifier","La liste des fichiers ouverts récemment","La liste des erreurs détectées dans les données","La liste des personnes ayant accès au fichier"],"correctIndex":0,"explanation":"Les étapes appliquées apparaissent dans le volet de droite de l'éditeur. Elles forment la recette de la requête et restent modifiables en tout temps."}],"downloadableFiles":[{"filename":"plan-du-cours-power-query.pdf","description":"Plan du cours en une page : la liste des modules dans l'ordre (Introduction — Pourquoi Power Query; puis nettoyage de base, types et formats, filtrer et transformer, fusionner et empiler des sources, actualiser sur de nouvelles données). Pour chaque module, l'objectif en une phrase et la compétence Power Query visée. En encadré, le vocabulaire clé de la leçon (requête, étapes appliquées, actualiser) et un rappel de où ça vit dans Excel (onglet Données, Obtenir des données, Transformer les données). Une note finale précise qu'il s'agit d'une formation pratique XGuard, sans certification officielle Microsoft."}],"scenario":null},{"id":"01-charger-donnees","idx":"1.1","title":"Charger et reconnaître ses données","durationSeconds":180,"summary":"Importer un fichier CSV brut dans une requête Power Query et promouvoir la première ligne en en-têtes, tout en comprenant que charger n'est pas coller dans la feuille.","narration":"[SCENE 1 — POURQUOI CHARGER | 0s-35s]\nBienvenue. Aujourd'hui, vous allez faire votre premier geste dans Power Query : charger un fichier de données.\n[pause 600ms]\nTout part d'un fichier d'export de ventes de formations XGuard. C'est un fichier CSV, c'est-à-dire un fichier texte brut, séparé par des virgules.\n[pause 400ms]\nAvant de toucher à quoi que ce soit, retenez une idée importante. Charger un fichier dans Power Query, ce n'est pas le même geste que de coller des données dans une feuille de calcul. Ici, on travaille dans une requête. Une requête, c'est une recette d'étapes qui se rejoue toute seule. Le fichier d'origine n'est jamais modifié.\n\n[SCENE 2 — CHOISIR LA SOURCE | 35s-90s]\nPremière étape : on choisit la source.\n[pause 400ms]\nÀ l'écran, on clique sur Obtenir les données, puis on choisit À partir d'un fichier texte ou CSV. On pointe vers notre fichier d'export.\n[pause 600ms]\nPower Query ouvre alors un aperçu. Regardez bien : c'est un aperçu, pas une copie. Vos données restent dans le fichier source. Tout ce que vous voyez ici, c'est une fenêtre vers ce fichier.\n[pause 400ms]\nEt tout de suite, regardez la première ligne du tableau. Elle contient bel et bien vos titres : Date, Représentant, Région, Formation et Montant. Mais Power Query ne le sait pas encore. Pour lui, cette première ligne n'est qu'une ligne de données comme les autres, et il a posé par-dessus des noms de colonnes génériques, du genre Colonne1, Colonne2, Colonne3.\n\n[SCENE 3 — PROMOUVOIR LES EN-TÊTES | 90s-150s]\nOn va corriger ça. On veut que cette première ligne serve de noms de colonnes.\n[pause 600ms]\nDeuxième étape : on promeut les en-têtes. À l'écran, on clique sur Utiliser la première ligne comme en-tête.\n[pause 400ms]\nVoici exactement ce que ce bouton fait, ni plus ni moins. Il prend la ligne qui est en première position, à ce moment précis, et il s'en sert comme noms de colonnes. C'est tout. Il ne cherche pas une « vraie » ligne de titres ailleurs dans le tableau. C'est pour ça que l'ordre compte : il faut que la bonne ligne soit en haut au moment où on clique.\n[pause 400ms]\nComme notre première ligne contenait déjà Date, Représentant, Région, Formation et Montant, ces mots montent dans l'en-tête et deviennent vos vrais noms de colonnes.\n[pause 600ms]\nRegardez à droite, dans le volet Étapes appliquées. Chaque geste que vous posez s'inscrit là, dans l'ordre. C'est ça, votre recette. Source, puis En-têtes promus. Deux étapes, déjà visibles.\n\n[SCENE 4 — CE QU'ON A GAGNÉ | 150s-180s]\nFaisons le point. Vous avez chargé un fichier CSV dans une requête, sans toucher au fichier d'origine.\n[pause 400ms]\nVous avez promu la première ligne en en-têtes. Votre jeu de données a maintenant des colonnes correctement nommées : Date, Représentant, Région, Formation et Montant.\n[pause 600ms]\nEt le meilleur : ces deux étapes se rejoueront automatiquement la prochaine fois que vous actualiserez la requête avec un nouvel export. C'est tout le pouvoir de Power Query. On configure une fois, on rejoue à l'infini. On se retrouve à la prochaine leçon.","productionNotes":"Ton : formateur calme, posé, précis. Rythme lent en scène 1 (on pose le concept requête vs feuille), un peu plus vif en scènes 2 et 3 quand l'action se passe à l'écran. Voix québécoise naturelle, vouvoiement constant.\n\nDécoupage écran, étape par étape :\n- Scène 1 (0-35s) : plan large de l'icône du fichier CSV, puis ouverture du ruban Données d'Excel. Surligner mentalement la distinction « requête » vs « feuille » avec un petit schéma : fichier source -> requête (recette) -> aperçu.\n- Scène 2 (35-90s) : zoom sur Obtenir les données > À partir d'un fichier texte ou CSV. Montrer la fenêtre d'aperçu qui s'ouvre. Pointer la première ligne (Date/Représentant/Région/Formation/Montant) et, au-dessus, les en-têtes génériques posés par Power Query (Colonne1, Colonne2...). Bien faire voir que les titres sont DANS les données, pas encore en en-tête.\n- Scène 3 (90-150s) : clic sur « Utiliser la première ligne comme en-tête ». Animer la bascule : la première ligne monte d'un cran et remplace Colonne1, Colonne2... par Date, Représentant, Région, Formation, Montant. Insister visuellement sur le fait que le bouton promeut la ligne du HAUT, celle qui est là au moment du clic — d'où l'importance de l'ordre. Faire un arrêt sur le volet Étapes appliquées à droite, pointer « Source » puis « En-têtes promus ».\n- Scène 4 (150-180s) : récap calme sur le tableau aux colonnes nommées. Terminer en survolant le bouton Actualiser pour préfigurer la notion de recette rejouable, sans cliquer.\n\nLa narration suit exactement l'ordre des deux objectifs du scénario : chooseSource (csv) puis promoteHeaders. La première ligne des données EST la ligne de titres, donc promoteHeaders donne bien Date/Représentant/Région/Formation/Montant — c'est reproductible tel quel par le moteur. Aucun anglicisme. Ne jamais promettre de certification Microsoft.","quiz":[{"question":"Quand vous chargez un fichier CSV dans Power Query, qu'est-ce qui se passe avec le fichier d'origine ?","options":["Il est copié et collé tel quel dans la feuille de calcul","Il reste intact : on travaille dans une requête qui pointe vers lui","Il est supprimé une fois l'aperçu affiché","Il est converti automatiquement en fichier Excel"],"correctIndex":1,"explanation":"Charger n'est pas coller dans la feuille. Power Query crée une requête, une recette d'étapes qui pointe vers le fichier source sans jamais le modifier."},{"question":"Que fait exactement le bouton « Utiliser la première ligne comme en-tête » ?","options":["Il cherche dans tout le tableau la vraie ligne de titres et la fait remonter","Il prend la ligne qui est en première position et s'en sert comme noms de colonnes","Il supprime les lignes parasites automatiquement","Il trie les colonnes par ordre alphabétique"],"correctIndex":1,"explanation":"Le bouton promeut simplement la ligne qui est en première position au moment du clic. Il ne détecte pas une « vraie » ligne de titres ailleurs : c'est pourquoi la bonne ligne doit être en haut avant de cliquer."},{"question":"À quoi sert le volet « Étapes appliquées » à droite de l'écran ?","options":["À supprimer définitivement le fichier source","À afficher la liste ordonnée des gestes posés, comme une recette rejouable","À changer la langue de l'interface","À imprimer le tableau"],"correctIndex":1,"explanation":"Chaque action s'inscrit dans les Étapes appliquées, dans l'ordre. C'est cette recette qui se rejoue automatiquement quand vous actualisez la requête avec un nouvel export."}],"downloadableFiles":[{"filename":"ventes-formations-brut.csv","description":"Le fichier CSV brut d'export des ventes de formations XGuard, dont la première ligne contient les titres de colonnes à promouvoir en en-têtes. Sert de point de départ à la simulation."}],"scenario":{"id":"01-charger-donnees","queryName":"VentesFormations","columns":[{"key":"date","label":"Colonne1","type":"text"},{"key":"representant","label":"Colonne2","type":"text"},{"key":"region","label":"Colonne3","type":"text"},{"key":"formation","label":"Colonne4","type":"text"},{"key":"montant","label":"Colonne5","type":"text"}],"rows":[{"date":"Date","representant":"Représentant","region":"Région","formation":"Formation","montant":"Montant"},{"date":"2026-06-02","representant":"Mélanie Tremblay","region":"MTL","formation":"Tireur actif","montant":"14 400,00 $"},{"date":"2026-06-04","representant":"Karim Benali","region":"QC","formation":"Code noir","montant":"9 600,00 $"},{"date":"2026-06-07","representant":"Joanie Lévesque","region":"GAT","formation":"Gestion de crise","montant":"7 200,00 $"},{"date":"2026-06-11","representant":"Mélanie Tremblay","region":"MTL","formation":"Agent de gardiennage","montant":"12 000,00 $"},{"date":"2026-06-15","representant":"David Côté","region":"QC","formation":"Tireur actif","montant":"14 400,00 $"},{"date":"2026-06-18","representant":"Karim Benali","region":"GAT","formation":"Code noir","montant":"9 600,00 $"}],"objectives":[{"id":"obj-1-source","label":"Choisir la source CSV","hint":"Cliquez sur Obtenir les données, puis À partir d'un fichier texte ou CSV, et choisissez le type de source « csv ».","demoCaption":"On pointe vers le fichier CSV brut. Power Query ouvre un aperçu, pas une copie.","stepLabel":"Source","action":{"type":"chooseSource","params":{"source":"csv"}}},{"id":"obj-2-headers","label":"Promouvoir les en-têtes","hint":"La première ligne contient déjà vos titres. Cliquez sur « Utiliser la première ligne comme en-tête » pour qu'elle serve de noms de colonnes.","demoCaption":"On promeut la première ligne : Date, Représentant, Région, Formation et Montant deviennent les noms de colonnes.","stepLabel":"En-têtes promus","action":{"type":"promoteHeaders"}}]}},{"id":"02-nettoyer","idx":"2.1","title":"Nettoyer un fichier de ventes brut","durationSeconds":210,"summary":"Nettoyer un fichier de ventes brut en retirant une colonne inutile, la ligne de total, en corrigeant le type du montant et en normalisant le code de région.","narration":"[SCENE 1 — LE FICHIER BRUT | 0s-30s]\nBienvenue. Aujourd'hui, on part d'un vrai fichier de ventes de formations XGuard, exporté tel quel. [pause 600ms] À l'écran, vous voyez sept colonnes : une colonne source, la date, le représentant, la région, le produit, la quantité et le montant. [pause 400ms] Le fichier fonctionne, mais il n'est pas propre. On va le remettre en ordre, une étape à la fois. À la fin, chaque étape sera enregistrée dans le panneau de droite, et vous pourrez tout rejouer quand vous voudrez.\n\n[SCENE 2 — RETIRER LA COLONNE INUTILE | 30s-70s]\nRegardez la première colonne, la colonne source. [pause 400ms] Elle contient toujours la même valeur, import deux mille vingt-six. C'est une trace technique laissée par l'export. Elle ne vous apprend rien sur vos ventes. [pause 600ms] On la retire. Sélectionnez la colonne source, faites un clic droit sur son en-tête, puis choisissez Supprimer. [pause 400ms] Voilà. La colonne disparaît, et dans les étapes appliquées à droite, vous voyez apparaître Colonnes supprimées. C'est votre première étape enregistrée.\n\n[SCENE 3 — ENLEVER LA LIGNE DE TOTAL | 70s-110s]\nDescendez maintenant tout en bas du tableau. [pause 400ms] La dernière ligne n'est pas une vente. C'est une ligne TOTAL, ajoutée par la personne qui a fait l'export. [pause 600ms] Dans Power Query, on ne garde jamais une ligne de total à l'intérieur des données. Elle fausse les calculs et les filtres. On l'enlève. [pause 400ms] Dans le ruban, ouvrez Supprimer des lignes, puis Supprimer les dernières lignes. Indiquez une seule ligne. [pause 400ms] La ligne TOTAL s'efface. Il ne reste que des vraies ventes. L'étape Lignes inférieures supprimées s'ajoute à droite.\n\n[SCENE 4 — CORRIGER LE TYPE DU MONTANT | 110s-160s]\nRegardez la colonne Montant. [pause 400ms] Les valeurs ressemblent à des nombres, mais Power Query les traite comme du texte. Vous le voyez à la petite icône dans l'en-tête. Tant que c'est du texte, vous ne pouvez ni additionner, ni faire de moyenne. [pause 600ms] On change le type. Cliquez sur l'icône de type, à gauche de l'en-tête Montant, puis choisissez Nombre décimal. [pause 400ms] Maintenant, le montant est un vrai nombre décimal. Power Query aligne les valeurs à droite, et vos calculs deviennent possibles. L'étape Type modifié apparaît dans le panneau.\n\n[SCENE 5 — NORMALISER LA RÉGION | 160s-195s]\nDernière étape. Regardez la colonne Région. [pause 400ms] Elle contient le code QC. Un code, c'est correct pour une machine, mais pas pour un rapport qu'un humain va lire. On veut le mot complet, Québec. [pause 600ms] Sélectionnez la colonne Région, ouvrez Remplacer les valeurs. Dans la valeur à rechercher, écrivez QC. Dans la valeur de remplacement, écrivez Québec. [pause 400ms] Toutes les cellules QC deviennent Québec. L'étape Valeur remplacée s'ajoute, et votre colonne est enfin lisible.\n\n[SCENE 6 — LE RÉSULTAT | 195s-210s]\nFaites le tour. [pause 400ms] Plus de colonne inutile, plus de ligne de total, un montant calculable, une région lisible. Quatre étapes, enregistrées dans le bon ordre à droite. [pause 600ms] Et le plus important : le mois prochain, vous collez un nouvel export, et ces quatre étapes se rejouent toutes seules. C'est ça, la force de Power Query. On se revoit à la prochaine leçon.","productionNotes":"Ton de formateur calme et précis, jamais vendeur. Rythme posé, environ 150 mots/minute, avec de vraies respirations aux pauses indiquées. Le voiceover Edge TTS doit prononcer « import deux mille vingt-six » et « QC » épelé « cu-cé » naturellement; vérifier au pré-check que « QC » n'est pas lu « quèbec » par erreur. Aucun anglicisme : on dit colonne, ligne, en-tête, requête, étape, actualiser.\n\nDécoupage écran, scène par scène, calé sur les objectifs du simulateur :\nSCENE 1 (0-30s) : plan large sur la grille des 7 colonnes (source, date, rep, region, produit, qte, montant) et les ~7 lignes de ventes + la ligne TOTAL en bas. Surligner doucement chaque en-tête au fil de la liste. Montrer le panneau « Étapes appliquées » encore vide à droite.\nSCENE 2 (30-70s) : zoom sur l'en-tête « source », curseur fait un clic droit, menu contextuel s'ouvre, surbrillance sur « Supprimer ». La colonne disparaît, l'étape « Colonnes supprimées » apparaît à droite (légende objectif 1).\nSCENE 3 (70-110s) : auto-scroll jusqu'au bas du tableau, halo rouge sur la ligne TOTAL. Ouvrir « Supprimer des lignes » > « Supprimer les dernières lignes », saisir 1, valider. La ligne TOTAL s'efface, étape « Lignes inférieures supprimées » (légende objectif 2).\nSCENE 4 (110-160s) : gros plan sur l'icône de type « ABC » (texte) de l'en-tête Montant, montrer les valeurs alignées à gauche (texte). Cliquer l'icône, choisir « Nombre décimal », les valeurs se ré-alignent à droite, icône devient « 1.2 ». Étape « Type modifié » (objectif 3).\nSCENE 5 (160-195s) : sélection de la colonne Région (toutes les cellules « QC » surlignées), ouvrir « Remplacer les valeurs », remplir Rechercher = QC, Remplacer = Québec, valider. Animation des cellules QC -> Québec. Étape « Valeur remplacée » (objectif 4).\nSCENE 6 (195-210s) : plan large final sur la table propre + les 4 étapes listées dans l'ordre à droite. Petit highlight sur le panneau d'étapes pour appuyer l'idée de rejeu automatique.\n\nPenser aux sous-titres burnés FR. Côté simulateur : la narration suit exactement l'ordre des 4 objectifs; l'auto-play doit afficher chaque demoCaption au moment correspondant de la scène.","quiz":[{"question":"Pourquoi retire-t-on la colonne « source » qui contient toujours « import_2026 » ?","options":["Parce qu'une colonne en texte est interdite dans Power Query","Parce qu'elle a toujours la même valeur et n'apporte aucune information sur les ventes","Parce qu'il faut toujours garder au maximum six colonnes","Parce que Power Query ne peut pas trier une colonne de texte"],"correctIndex":1,"explanation":"Une colonne dont chaque cellule contient la même valeur est une trace technique de l'export. Elle n'aide pas l'analyse, alors on la supprime pour alléger le jeu de données."},{"question":"Que se passe-t-il si on laisse la ligne « TOTAL » à l'intérieur des données ?","options":["Rien, Power Query l'ignore automatiquement","Elle fausse les calculs et les filtres faits ensuite sur les vraies ventes","Elle est convertie en en-tête","Elle bloque le changement de type des colonnes"],"correctIndex":1,"explanation":"Une ligne de total mélangée aux données est comptée comme une ligne normale. Elle gonfle les sommes et perturbe les filtres. On l'enlève avec Supprimer les dernières lignes."},{"question":"Pourquoi faut-il changer le type de la colonne « Montant » de texte vers nombre décimal ?","options":["Pour que les valeurs s'affichent en gras","Parce qu'un montant en texte ne peut être ni additionné ni moyenné","Pour supprimer automatiquement le symbole de dollar","Parce que le texte n'est pas autorisé dans une requête"],"correctIndex":1,"explanation":"Tant que le montant est du texte, aucun calcul n'est possible. En le passant en nombre décimal, on peut additionner, faire des moyennes et l'utiliser dans des rapports."}],"downloadableFiles":[{"filename":"ventes-brut.xlsx","description":"Fichier de départ : export brut des ventes de formations XGuard avec la colonne source inutile, une ligne TOTAL en bas, le montant en texte et la région en code QC."},{"filename":"ventes-nettoye-solution.xlsx","description":"Fichier corrigé : colonne source retirée, ligne TOTAL enlevée, montant en nombre décimal et région affichée « Québec »."}],"scenario":{"id":"02-nettoyer","queryName":"Ventes_formations_brut","columns":[{"key":"source","label":"Source","type":"text"},{"key":"date","label":"Date","type":"date"},{"key":"rep","label":"Représentant","type":"text"},{"key":"region","label":"Région","type":"text"},{"key":"produit","label":"Produit","type":"text"},{"key":"qte","label":"Qté","type":"integer"},{"key":"montant","label":"Montant","type":"text"}],"rows":[{"source":"import_2026","date":"2026-01-12","rep":"Marie-Pier Tremblay","region":"QC","produit":"Tireur actif","qte":"12","montant":"14 400,00 $"},{"source":"import_2026","date":"2026-01-19","rep":"Sébastien Gagnon","region":"MTL","produit":"Code noir","qte":"8","montant":"9 600,00 $"},{"source":"import_2026","date":"2026-02-03","rep":"Marie-Pier Tremblay","region":"GAT","produit":"Gestion de crise","qte":"5","montant":"6 250,00 $"},{"source":"import_2026","date":"2026-02-14","rep":"Karine Bouchard","region":"QC","produit":"Tireur actif","qte":"15","montant":"18 000,00 $"},{"source":"import_2026","date":"2026-03-02","rep":"Sébastien Gagnon","region":"MTL","produit":"Espace clos","qte":"10","montant":"13 500,00 $"},{"source":"import_2026","date":"2026-03-18","rep":"Karine Bouchard","region":"QC","produit":"Code noir","qte":"6","montant":"7 200,00 $"},{"source":"import_2026","date":"2026-03-27","rep":"Yannick Lévesque","region":"GAT","produit":"Gestion de crise","qte":"9","montant":"11 250,00 $"},{"source":"","date":"","rep":"","region":"","produit":"TOTAL","qte":"65","montant":"80 200,00 $","total":true}],"objectives":[{"id":"obj-1-remove-source","label":"Retirer la colonne source","hint":"Sélectionnez l'en-tête de la colonne Source, faites un clic droit, puis choisissez Supprimer.","demoCaption":"On enlève la colonne source : c'est juste une trace d'export, elle n'apprend rien sur les ventes.","stepLabel":"Colonnes supprimées","action":{"type":"removeColumn","target":"source"}},{"id":"obj-2-remove-total","label":"Enlever la ligne TOTAL","hint":"Ouvrez Supprimer des lignes, puis Supprimer les dernières lignes, et indiquez 1 ligne.","demoCaption":"La dernière ligne est un TOTAL, pas une vente. On retire la ligne du bas pour ne garder que des vraies ventes.","stepLabel":"Lignes inférieures supprimées","action":{"type":"removeBottomRows","params":{"count":1}}},{"id":"obj-3-montant-decimal","label":"Montant en nombre décimal","hint":"Cliquez l'icône de type à gauche de l'en-tête Montant, puis choisissez Nombre décimal.","demoCaption":"Le montant est en texte. On le passe en nombre décimal pour pouvoir l'additionner.","stepLabel":"Type modifié","action":{"type":"changeType","target":"montant","params":{"toType":"decimal"}}},{"id":"obj-4-region-quebec","label":"QC devient Québec","hint":"Sélectionnez la colonne Région, ouvrez Remplacer les valeurs, remplacez QC par Québec.","demoCaption":"On remplace le code QC par le mot complet Québec, pour un rapport lisible par un humain.","stepLabel":"Valeur remplacée","action":{"type":"replaceValue","target":"region","params":{"from":"QC","to":"Québec"}}}]}},{"id":"03-transformer","idx":"3.1","title":"Fractionner, mettre en forme, enrichir","durationSeconds":210,"summary":"Apprendre à fractionner une colonne, normaliser le texte et créer une colonne conditionnelle pour produire des colonnes propres et réutilisables dans Power Query.","narration":"[SCENE 1 — MISE EN CONTEXTE | 0s-28s]\nBienvenue dans cette leçon sur la transformation des données. [pause 600ms] Cette fois, on ne nettoie pas. Le jeu de données est déjà propre. On va plutôt l'enrichir. [pause 400ms] Vous avez devant vous une requête de ventes de formations XGuard. Chaque ligne, c'est un agent, sa région, son montant de ventes et une date. [pause 600ms] Le but de la leçon, c'est de transformer ces colonnes pour les rendre plus utiles. On va fractionner une colonne, mettre du texte en forme, puis créer une nouvelle colonne calculée. Trois gestes simples qui produisent des colonnes propres et réutilisables.\n\n[SCENE 2 — FRACTIONNER LA COLONNE AGENT | 28s-72s]\nRegardez la colonne agent. [pause 400ms] Le nom est écrit en un seul morceau : Tremblay, virgule, Marie. Le nom de famille et le prénom sont collés dans la même colonne. [pause 600ms] Ce n'est pas pratique. Si vous voulez trier par prénom, ou afficher seulement le nom de famille, vous êtes coincé. [pause 400ms] On va donc fractionner cette colonne. Sélectionnez la colonne agent. Dans le menu Transformer, choisissez Fractionner la colonne, puis Par délimiteur. [pause 600ms] Le délimiteur ici, c'est la virgule suivie d'une espace. Power Query va couper le texte à cet endroit précis. [pause 400ms] On obtient deux colonnes : une colonne Nom et une colonne Prénom. [pause 600ms] Une seule colonne brouillonne vient de devenir deux colonnes claires et séparées.\n\n[SCENE 3 — METTRE LE PRÉNOM EN FORME | 72s-118s]\nMaintenant, occupons-nous de la mise en forme. [pause 400ms] Regardez la colonne Prénom. Les valeurs ne sont pas toutes écrites de la même façon. Certaines sont en minuscules, d'autres tout en majuscules. [pause 600ms] Pour un rapport, ça fait désordre. On veut une présentation uniforme : la première lettre en majuscule, le reste en minuscules. [pause 400ms] Sélectionnez la colonne Prénom. Dans le menu Transformer, allez dans Format, puis choisissez Mettre en majuscule chaque mot. [pause 600ms] Et voilà. Marie devient Marie, jean devient Jean, SOPHIE devient Sophie. [pause 400ms] Tout est aligné sur le même format. C'est ce qu'on appelle normaliser le texte. [pause 600ms] Important : cette transformation s'applique à la colonne entière, et elle restera dans les étapes. Si de nouvelles données arrivent, elles seront mises en forme automatiquement.\n\n[SCENE 4 — CRÉER UNE COLONNE CONDITIONNELLE | 118s-176s]\nPassons au geste le plus puissant : créer une nouvelle colonne calculée. [pause 600ms] On veut classer chaque agent selon son montant de ventes. Au-dessus de dix mille dollars, c'est un grand compte. En dessous, c'est un compte standard. [pause 400ms] On pourrait faire ce calcul à la main, mais ce serait long et fragile. À la place, on laisse Power Query décider pour nous, ligne par ligne. [pause 600ms] Dans le menu Ajouter une colonne, choisissez Colonne conditionnelle. [pause 400ms] On nomme la nouvelle colonne Catégorie. La condition est simple : si la colonne montant est plus grande que dix mille, alors la valeur sera Grand compte. Sinon, ce sera Standard. [pause 600ms] Validez. Une nouvelle colonne apparaît à droite. [pause 400ms] Chaque ligne est maintenant étiquetée automatiquement, sans aucune formule manuelle. [pause 600ms] Et le plus beau : cette logique fait partie de la requête. Elle se ré-appliquera toute seule sur les prochaines données.\n\n[SCENE 5 — RÉCAPITULATION | 176s-210s]\nFaisons le bilan. [pause 600ms] En trois étapes, vous avez transformé un tableau ordinaire en données enrichies. [pause 400ms] Premièrement, vous avez fractionné la colonne agent en Nom et Prénom. Deuxièmement, vous avez mis le prénom en forme pour un affichage uniforme. Troisièmement, vous avez créé une colonne Catégorie qui classe chaque agent automatiquement. [pause 600ms] Chacun de ces gestes a produit des colonnes propres et réutilisables. [pause 400ms] Et comme tout est enregistré dans les étapes appliquées, vous pouvez rejouer ces transformations sur n'importe quel nouveau fichier de ventes. [pause 600ms] Fractionner, mettre en forme, enrichir : trois réflexes qui transforment des données brutes en information prête à l'emploi. On se retrouve à la prochaine leçon.","productionNotes":"Ton : formateur calme et précis, débit posé (environ 150 mots/minute), aucune emphase de vente. Pauses respectées telles qu'indiquées pour laisser l'œil suivre l'écran.\n\nDécoupage écran scène par scène, synchronisé avec l'auto-play du simulateur :\n- Scène 1 (0-28s) : plan large sur la requête déjà propre. Surligner doucement les 4 colonnes (agent, region, montant, date) au fil de l'énumération. Aucune action encore.\n- Scène 2 (28-72s) : zoom sur la colonne agent, montrer une cellule type \"Tremblay, Marie\". Au moment de \"menu Transformer > Fractionner la colonne > Par délimiteur\", afficher le menu puis la boîte de dialogue avec le délimiteur \", \" (virgule + espace) en surbrillance. À la validation, animer la séparation en deux colonnes Nom et Prénom. Étape \"Colonne fractionnée\" apparaît dans Étapes appliquées.\n- Scène 3 (72-118s) : surligner les valeurs hétérogènes du Prénom (marie / JEAN / SOPHIE). Au moment de \"Format > Mettre en majuscule chaque mot\", montrer le menu puis la colonne qui se normalise cellule par cellule. Étape \"Texte mis en forme\" ajoutée.\n- Scène 4 (118-176s) : ouvrir le panneau \"Ajouter une colonne > Colonne conditionnelle\". Montrer le formulaire : nom = Catégorie, Si montant > 10000, Alors \"Grand compte\", Sinon \"Standard\". À la validation, la colonne Catégorie apparaît à droite, chaque ligne s'étiquette. Étape \"Colonne conditionnelle ajoutée\".\n- Scène 5 (176-210s) : afficher le volet \"Étapes appliquées\" complet (Source > En-têtes promus > Colonne fractionnée > Texte mis en forme > Colonne conditionnelle ajoutée) et balayer du regard les 3 étapes clés pendant la récap.\n\nLa narration suit exactement l'ordre des objectifs du scénario : splitColumn -> transformText -> conditionalColumn. Ne jamais promettre de certification Microsoft. Insister visuellement sur le caractère réutilisable des étapes appliquées.","quiz":[{"question":"Pourquoi fractionne-t-on la colonne Agent qui contient « Tremblay, Marie » ?","options":["Pour supprimer le nom de famille du tableau","Pour séparer le nom et le prénom dans deux colonnes distinctes et réutilisables","Pour convertir le texte en nombre","Pour trier la colonne par ordre alphabétique"],"correctIndex":1,"explanation":"Fractionner par délimiteur (la virgule-espace) coupe « Tremblay, Marie » en une colonne Nom et une colonne Prénom, ce qui rend chaque information utilisable séparément."},{"question":"À quoi sert l'opération « Mettre en majuscule chaque mot » appliquée au Prénom ?","options":["À traduire les prénoms","À filtrer les lignes vides","À uniformiser l'écriture : première lettre en majuscule, le reste en minuscules","À changer le type de la colonne en nombre"],"correctIndex":2,"explanation":"C'est une normalisation du texte : « jean » et « SOPHIE » deviennent « Jean » et « Sophie », pour un affichage uniforme. La transformation reste dans les étapes appliquées."},{"question":"Que fait la colonne conditionnelle « Catégorie » créée à la fin de la leçon ?","options":["Elle additionne tous les montants de ventes","Elle attribue « Grand compte » si le montant dépasse 10 000 $, sinon « Standard »","Elle supprime les lignes en dessous de 10 000 $","Elle remplace la colonne Montant par du texte"],"correctIndex":1,"explanation":"La colonne conditionnelle teste chaque ligne : si Montant > 10000, la valeur est « Grand compte », sinon « Standard ». La logique fait partie de la requête et se ré-applique sur de nouvelles données."}],"downloadableFiles":[{"filename":"agents-ventes.xlsx","description":"Jeu de données de départ déjà propre : ventes de formations par agent (Agent, Région, Montant, Date), pour pratiquer le fractionnement, la mise en forme du texte et la colonne conditionnelle."}],"scenario":{"id":"03-transformer","queryName":"Ventes_formations_agents","columns":[{"key":"agent","label":"Agent","type":"text"},{"key":"region","label":"Région","type":"text"},{"key":"montant","label":"Montant ventes","type":"decimal"},{"key":"date","label":"Date","type":"date"}],"rows":[{"agent":"Tremblay, Marie","region":"MTL","montant":"14400.00","date":"2026-02-12"},{"agent":"Gagnon, jean","region":"QC","montant":"8200.00","date":"2026-02-18"},{"agent":"Bouchard, SOPHIE","region":"GAT","montant":"21750.00","date":"2026-03-03"},{"agent":"Roy, david","region":"MTL","montant":"9650.00","date":"2026-03-09"},{"agent":"Lavoie, NATHALIE","region":"QC","montant":"17300.00","date":"2026-03-21"},{"agent":"Fortin, marc","region":"GAT","montant":"6900.00","date":"2026-04-02"},{"agent":"Pelletier, Isabelle","region":"MTL","montant":"12500.00","date":"2026-04-15"}],"objectives":[{"id":"obj-1-split-agent","label":"Fractionner la colonne Agent","hint":"Sélectionnez la colonne Agent, puis Transformer > Fractionner la colonne > Par délimiteur, avec le délimiteur virgule-espace.","demoCaption":"On coupe le nom collé en deux colonnes : Nom et Prénom.","stepLabel":"Colonne fractionnée","action":{"type":"splitColumn","target":"agent","params":{"delimiter":", ","intoKeys":["nom","prenom"],"intoLabels":["Nom","Prénom"]}}},{"id":"obj-2-format-prenom","label":"Mettre le Prénom en forme","hint":"Sélectionnez la colonne Prénom, puis Transformer > Format > Mettre en majuscule chaque mot.","demoCaption":"On uniformise le prénom : première lettre en majuscule, le reste en minuscules.","stepLabel":"Texte mis en forme","action":{"type":"transformText","target":"prenom","params":{"op":"capitalize"}}},{"id":"obj-3-categorie-conditionnelle","label":"Créer la colonne Catégorie","hint":"Ajouter une colonne > Colonne conditionnelle : si Montant > 10000 alors Grand compte, sinon Standard.","demoCaption":"On classe chaque agent automatiquement selon son montant de ventes.","stepLabel":"Colonne conditionnelle ajoutée","action":{"type":"conditionalColumn","params":{"newKey":"categorie","label":"Catégorie","ifCol":"montant","op":"greaterThan","value":"10000","thenValue":"Grand compte","elseValue":"Standard"}}}]}},{"id":"04-combiner","idx":"4.1","title":"Empiler et fusionner des tables","durationSeconds":230,"summary":"Apprendre à combiner deux tables : empiler les ventes de février sous celles de janvier, puis fusionner avec la table des représentants pour ramener le superviseur par la clé.","narration":"[SCENE 1 — POSER LE PROBLÈME | 0s-30s]\nVous avez vos ventes de formations pour janvier, bien propres, dans une requête. Mais le mois prochain, février arrive. Et après, mars. [pause 600ms] La question, c'est : comment ajouter ces nouveaux mois sans tout refaire à la main? Et comment ramener de l'information qui vit dans une autre table, comme le superviseur de chaque représentant? [pause 600ms] Dans cette leçon, vous allez voir les deux gestes qui répondent à ça : empiler et fusionner. Ce sont deux choses différentes, et c'est important de ne pas les mélanger.\n\n[SCENE 2 — EMPILER VS FUSIONNER | 30s-58s]\nVoici l'idée en une image. [pause 600ms] Empiler, c'est mettre des lignes sous d'autres lignes. Les colonnes sont les mêmes, on rajoute du monde par en dessous. C'est exactement ce qu'on fait quand février arrive : mêmes colonnes, nouvelles ventes. [pause 600ms] Fusionner, c'est complètement autre chose. On va chercher de l'information dans une deuxième table et on la colle à côté, sur la même ligne, en se servant d'une clé commune. [pause 600ms] Empiler ajoute des lignes en dessous. Fusionner ajoute des colonnes à côté. Gardez cette phrase en tête.\n\n[SCENE 3 — EMPILER FÉVRIER | 58s-108s]\nCommençons par empiler. À l'écran, on a la requête de janvier : le représentant, la région, la formation vendue, le montant. [pause 600ms] On veut ajouter par en dessous les trois ventes de février. Dans le ruban, on choisit Ajouter des requêtes. [pause 600ms] Le simulateur va empiler trois nouvelles lignes : une vente à Gatineau, une à Montréal, une dans la région de Québec, toutes datées de février. [pause 600ms] Regardez bien : aucune colonne n'a changé. On a juste plus de lignes. La table de janvier et celle de février se sont collées, l'une en dessous de l'autre, parce qu'elles ont la même structure. [pause 600ms] C'est ça, empiler. Et le plus beau, c'est que cette étape reste enregistrée. Le mois prochain, vous remplacez le fichier et tout se rejoue tout seul.\n\n[SCENE 4 — FUSIONNER LES REPRÉSENTANTS | 108s-178s]\nMaintenant, la fusion. [pause 600ms] Votre table a une colonne représentant, mais elle n'a pas le superviseur de chaque personne. Cette information existe ailleurs, dans une petite table qui s'appelle Représentants. Dans cette table, chaque représentant est associé à son superviseur. [pause 600ms] On ne veut pas copier-coller ça à la main. On va fusionner. [pause 600ms] La clé commune entre les deux tables, c'est le nom du représentant. On dit donc à Power Query : prends la colonne représentant comme clé, va voir dans la table Représentants, et ramène-moi le superviseur. [pause 600ms] Le simulateur exécute la fusion. Une nouvelle colonne Superviseur apparaît, à droite. Pour Mélanie Côté, on voit son superviseur. Pour Karl Bélanger aussi. Chaque ligne reçoit le bon superviseur, parce que la clé a fait le pont entre les deux tables. [pause 600ms] Remarquez : on n'a pas ajouté de lignes. On a ajouté une colonne. Voilà la différence concrète avec l'empilement.\n\n[SCENE 5 — RÉCAPITULER | 178s-230s]\nFaisons le tour. [pause 600ms] Premier geste : on a empilé février sous janvier avec Ajouter des requêtes. Mêmes colonnes, plus de lignes. [pause 600ms] Deuxième geste : on a fusionné avec la table Représentants pour ramener le superviseur, en utilisant le nom du représentant comme clé. Mêmes lignes, une colonne de plus. [pause 600ms] Le réflexe à garder : quand vous avez d'autres lignes à ajouter, du même genre, vous empilez. Quand vous avez de l'information à aller chercher dans une autre table par une clé commune, vous fusionnez. [pause 600ms] Et comme tout est enregistré en étapes, ces deux gestes vont se rejouer automatiquement chaque mois. Vous bâtissez une fois, et le rapport se met à jour tout seul. [pause 600ms] Dans la prochaine leçon, on va apprendre à actualiser tout ça d'un seul clic quand de nouvelles données arrivent.","productionNotes":"Ton : formateur calme et précis, jamais vendeur. Rythme posé, environ 150 mots/minute pour tenir 230 secondes. SCENE 1 (0-30s) : montrer la requête janvier déjà propre à l'écran, puis un mockup mental « février qui arrive ». SCENE 2 (30-58s) : afficher un schéma simple, deux blocs empilés verticalement (empiler) à gauche, deux blocs côte à côte reliés par une clé (fusionner) à droite ; insister visuellement sur « lignes en dessous » vs « colonnes à côté ». SCENE 3 (58-108s) : exécuter l'objectif obj1 (appendQuery) ; à l'écran, les 3 lignes de février glissent sous les lignes de janvier, surligner que les en-têtes ne bougent pas, faire apparaître l'étape « Février empilé » dans le panneau Étapes appliquées. SCENE 4 (108-178s) : exécuter obj2 (mergeQuery) ; montrer d'abord la mini-table Représentants à part, puis la nouvelle colonne Superviseur qui se remplit ligne par ligne, surligner la colonne rep comme clé du pont. SCENE 5 (178-230s) : panneau Étapes appliquées complet à l'écran avec les deux étapes nommées, récap visuel du schéma empiler/fusionner. L'ordre des scènes suit exactement l'ordre des objectifs du scénario : appendQuery puis mergeQuery.","quiz":[{"question":"Vous recevez les ventes de février, avec exactement les mêmes colonnes que janvier, et vous voulez les mettre sous celles de janvier. Quelle opération utilisez-vous?","options":["Fusionner les requêtes (Merge)","Ajouter des requêtes / empiler (Append)","Fractionner la colonne","Actualiser"],"correctIndex":1,"explanation":"Empiler (Ajouter des requêtes) met des lignes sous d'autres lignes quand les colonnes sont les mêmes. C'est exactement le cas de février sous janvier."},{"question":"Vous voulez ramener le superviseur de chaque représentant à partir d'une autre table, en utilisant le nom du représentant comme clé commune. Que faites-vous?","options":["Vous empilez les deux tables","Vous supprimez la colonne représentant","Vous fusionnez les requêtes par la clé représentant","Vous changez le type de la colonne"],"correctIndex":2,"explanation":"Fusionner va chercher de l'information dans une autre table et la colle à côté, sur la même ligne, en s'appuyant sur une clé commune. Ici la clé est le nom du représentant."},{"question":"Quelle phrase résume correctement la différence entre empiler et fusionner?","options":["Empiler ajoute des colonnes à côté; fusionner ajoute des lignes en dessous","Empiler ajoute des lignes en dessous; fusionner ajoute des colonnes à côté par une clé","Les deux ajoutent des lignes, mais fusionner est plus rapide","Les deux ajoutent des colonnes, mais empiler garde les types"],"correctIndex":1,"explanation":"Empiler ajoute des lignes en dessous (mêmes colonnes). Fusionner ajoute une ou des colonnes à côté, en reliant les tables par une clé commune."}],"downloadableFiles":[{"filename":"ventes-janvier.xlsx","description":"Tableur des ventes de formations XGuard pour janvier 2026 : représentant, région, formation vendue, montant. C'est la table de départ chargée dans la requête."},{"filename":"ventes-fevrier.xlsx","description":"Tableur des ventes de février 2026 à empiler sous celles de janvier (mêmes colonnes). Sert à pratiquer l'opération Ajouter des requêtes."},{"filename":"representants.xlsx","description":"Petite table de correspondance : chaque représentant et son superviseur. Sert de table source pour l'opération Fusionner par la clé du représentant."}],"scenario":{"id":"04-combiner","queryName":"Ventes_Formations_2026","columns":[{"key":"rep","label":"Représentant","type":"text"},{"key":"region","label":"Région","type":"text"},{"key":"formation","label":"Formation vendue","type":"text"},{"key":"date","label":"Date","type":"date"},{"key":"montant","label":"Montant","type":"text"}],"rows":[{"rep":"Mélanie Côté","region":"MTL","formation":"Tireur actif","date":"2026-01-08","montant":"1 250,00 $"},{"rep":"Karl Bélanger","region":"QC","formation":"Code noir","date":"2026-01-12","montant":"980,00 $"},{"rep":"Mélanie Côté","region":"GAT","formation":"Gestion de crise","date":"2026-01-19","montant":"1 480,00 $"},{"rep":"Sophie Tremblay","region":"MTL","formation":"Gardiennage de base","date":"2026-01-23","montant":"750,00 $"},{"rep":"Karl Bélanger","region":"QC","formation":"Tireur actif","date":"2026-01-27","montant":"1 250,00 $"},{"rep":"Sophie Tremblay","region":"GAT","formation":"Code noir","date":"2026-01-30","montant":"980,00 $"}],"objectives":[{"id":"obj1","label":"Empiler février sous janvier","hint":"Dans le ruban, cliquez Ajouter des requêtes (Append) pour empiler les ventes de février sous celles de janvier.","demoCaption":"On empile les ventes de février sous celles de janvier. Mêmes colonnes, plus de lignes.","stepLabel":"Février empilé","action":{"type":"appendQuery","params":{"rows":[{"rep":"Karl Bélanger","region":"GAT","formation":"Gestion de crise","date":"2026-02-05","montant":"1 480,00 $"},{"rep":"Mélanie Côté","region":"MTL","formation":"Tireur actif","date":"2026-02-11","montant":"1 250,00 $"},{"rep":"Sophie Tremblay","region":"QC","formation":"Code noir","date":"2026-02-18","montant":"980,00 $"}],"note":"Feuille Février"}}},{"id":"obj2","label":"Fusionner pour ramener le superviseur","hint":"Cliquez Fusionner les requêtes (Merge), choisissez la colonne Représentant comme clé, et ramenez la colonne Superviseur depuis la table Représentants.","demoCaption":"On fusionne avec la table Représentants pour ramener le superviseur, par la clé du représentant.","stepLabel":"Superviseur fusionné","action":{"type":"mergeQuery","params":{"keyCol":"rep","bring":[{"key":"superviseur","label":"Superviseur","lookup":{"Mélanie Côté":"Daniel Roy","Karl Bélanger":"Daniel Roy","Sophie Tremblay":"Isabelle Gagnon"}}],"note":"Table Représentants"}}}]}},{"id":"05-actualiser","idx":"5.1","title":"Les étapes appliquées et l'actualisation","durationSeconds":200,"summary":"Comprendre que chaque action devient une étape rejouable, savoir nommer ces étapes, et utiliser l'actualisation pour réappliquer tout le nettoyage sur de nouvelles données sans rien refaire.","narration":"[SCENE 1 — POURQUOI LES ÉTAPES | 0s-35s]\nBienvenue. Dans cette leçon, on touche au coeur de Power Query. [pause 600ms] Jusqu'ici, vous avez appris à nettoyer un jeu de données. Maintenant, on va voir pourquoi ce nettoyage vaut de l'or. À l'écran, un tableau des ventes de formations XGuard pour février 2026. Une colonne représentant, une colonne région, une colonne montant. [pause 400ms] Regardez à droite : le volet des étapes appliquées. Chaque geste que vous posez s'y inscrit, dans l'ordre, comme une recette. Power Query ne fait pas juste modifier vos données. Il enregistre la marche à suivre.\n\n[SCENE 2 — CRÉER UNE ÉTAPE | 35s-75s]\nCommençons par un nettoyage simple pour créer une première étape. [pause 400ms] Notre tableau contient des lignes sans région : des entrées incomplètes qu'on ne veut pas garder. On va filtrer la colonne région pour retirer les valeurs vides. Vous cliquez sur la flèche de la colonne région, puis vous décochez la valeur vide. [pause 600ms] Les lignes incomplètes disparaissent. Et surtout, regardez le volet de droite : une nouvelle étape vient d'apparaître. Power Query l'a nommée automatiquement, quelque chose comme « Lignes filtrées ». Vous venez d'écrire la première ligne de votre recette.\n\n[SCENE 3 — NOMMER L'ÉTAPE | 75s-120s]\nLe nom donné par défaut est correct, mais pas toujours clair. [pause 400ms] Dans trois mois, « Lignes filtrées », ça veut dire quoi exactement ? On va donc renommer cette étape pour qu'elle se lise toute seule. Vous faites un clic droit sur l'étape dans le volet de droite, puis vous choisissez « Renommer ». [pause 600ms] On va l'appeler « Lignes vides retirées ». Voilà. [pause 400ms] Ça peut sembler un détail, mais c'est une habitude de pro. Une requête bien nommée, c'est une requête que vous, ou un collègue, comprendrez dans six mois sans deviner. Chaque étape raconte ce qu'elle fait.\n\n[SCENE 4 — LE PUNCH : ACTUALISER | 120s-175s]\nEt maintenant, le moment qui change tout. [pause 600ms] Imaginez : on est rendu en mars. De nouvelles ventes sont entrées dans le fichier source. Trois nouvelles lignes pour le mois de mars 2026. En temps normal, dans un tableur ordinaire, il faudrait tout refaire à la main : retrouver les lignes vides, les filtrer, renommer. [pause 400ms] Avec Power Query, vous cliquez sur un seul bouton : Actualiser. [pause 600ms] Regardez bien l'écran. Les trois nouvelles lignes de mars arrivent, et instantanément, toutes vos étapes se rejouent dans l'ordre. Le filtre des lignes vides s'applique encore. Votre recette s'exécute au complet, automatiquement, sur les nouvelles données.\n\n[SCENE 5 — FAIRE UNE FOIS, POUR TOUJOURS | 175s-200s]\nC'est ça, la vraie puissance de Power Query. [pause 600ms] Vous nettoyez une fois. Vous construisez votre recette une seule fois. Et ensuite, chaque mois, chaque semaine, à chaque nouveau fichier, vous cliquez sur Actualiser et tout se refait tout seul. [pause 400ms] Le travail manuel qui vous prenait une heure devient un clic. Faire une fois, actualiser pour toujours. Dans la prochaine leçon, on poussera cette idée plus loin avec l'automatisation complète. À tantôt.","productionNotes":"Ton : formateur calme, posé, qui construit vers un punch. Le rythme monte légèrement à la Scène 4 — c'est le moment fort, on veut un petit effet de révélation sans tomber dans le vendeur. Rythme global d'environ 150 mots/minute pour tenir les 200 secondes.\n\nCe que l'écran montre, étape par étape, en synchro avec la narration :\n- Scène 1 : plan large de l'éditeur Power Query. Tableau de 7 lignes (ventes février 2026), 3 colonnes visibles (représentant, région, montant). Curseur qui pointe le volet « Étapes appliquées » à droite, encore presque vide (juste « Source » et « En-têtes promus »).\n- Scène 2 : zoom sur l'en-tête de la colonne région, clic sur la flèche de filtre, on décoche la case vide. Deux lignes (les régions vides) disparaissent avec une transition douce. Une nouvelle étape « Lignes filtrées » apparaît en surbrillance dans le volet de droite.\n- Scène 3 : clic droit sur l'étape « Lignes filtrées », menu contextuel, « Renommer ». Le texte se transforme en champ éditable, on tape « Lignes vides retirées ». Mettre en évidence le nom final.\n- Scène 4 : c'est la scène-clé. Montrer le bouton Actualiser surligné. Au clic : 3 nouvelles lignes (mars 2026) entrent visuellement par le bas du tableau, puis on voit le filtre se rejouer (les éventuelles vides parmi les nouvelles seraient retirées). Idéalement, animer brièvement le volet des étapes qui « clignote » de haut en bas pour montrer la ré-exécution séquentielle.\n- Scène 5 : retour plan large, tableau final propre avec les lignes de mars intégrées. Texte à l'écran : « Faire une fois, actualiser pour toujours. »\n\nNote voix (Edge TTS) : « tantôt » se prononce naturellement, pas de correction dico nécessaire. Surveiller « Power Query » qui doit rester intact. Pas de gras, pas d'anglicisme à l'oral.","quiz":[{"question":"À quoi sert le volet « Étapes appliquées » dans Power Query ?","options":["À afficher uniquement la dernière modification faite aux données","À enregistrer dans l'ordre chaque action posée, comme une recette rejouable","À sauvegarder une copie de sécurité du fichier original","À calculer automatiquement la somme des colonnes de montants"],"correctIndex":1,"explanation":"Chaque action que vous posez s'inscrit comme une étape dans l'ordre. Cette suite d'étapes forme une recette que Power Query peut rejouer au complet."},{"question":"Pourquoi renommer une étape comme « Lignes vides retirées » plutôt que de garder « Lignes filtrées » ?","options":["Parce que Power Query refuse d'actualiser si les étapes ne sont pas renommées","Pour que la requête se lise toute seule et reste compréhensible dans le temps","Parce que renommer accélère le traitement des données","Parce que c'est obligatoire pour exporter vers Excel"],"correctIndex":1,"explanation":"Renommer clairement une étape la rend compréhensible pour vous ou un collègue plusieurs mois plus tard, sans avoir à deviner ce qu'elle fait."},{"question":"Que se passe-t-il quand vous cliquez sur « Actualiser » après avoir ajouté de nouvelles lignes au fichier source ?","options":["Seules les nouvelles lignes sont ajoutées, sans aucun nettoyage","Toutes les étapes enregistrées se rejouent automatiquement sur l'ensemble des données","Power Query efface les anciennes étapes et repart à zéro","Il faut refaire chaque étape manuellement sur les nouvelles lignes"],"correctIndex":1,"explanation":"C'est le punch de Power Query : à l'actualisation, toute la recette d'étapes se rejoue dans l'ordre sur les nouvelles données. Faire une fois, actualiser pour toujours."}],"downloadableFiles":[{"filename":"ventes-avec-etapes.xlsx","description":"Classeur Excel des ventes de formations XGuard (février 2026) avec lignes incomplètes à filtrer, prêt pour pratiquer la création d'étapes et l'actualisation."}],"scenario":{"id":"05-actualiser","queryName":"Ventes formations - Février 2026","columns":[{"key":"representant","label":"Représentant","type":"text"},{"key":"region","label":"Région","type":"text"},{"key":"formation","label":"Formation","type":"text"},{"key":"montant","label":"Montant","type":"text"}],"rows":[{"representant":"Marie-Claude Bélanger","region":"MTL","formation":"Tireur actif","montant":"2 400,00 $"},{"representant":"Patrick Lavoie","region":"QC","formation":"Code noir","montant":"1 800,00 $"},{"representant":"Sophie Tremblay","region":"","formation":"Gestion de crise","montant":"3 200,00 $"},{"representant":"Jean-François Roy","region":"GAT","formation":"Tireur actif","montant":"2 400,00 $"},{"representant":"Nadia Cormier","region":"MTL","formation":"Code noir","montant":"1 800,00 $"},{"representant":"Éric Pelletier","region":"","formation":"Gardiennage événementiel","montant":"1 200,00 $"},{"representant":"Valérie Gagnon","region":"QC","formation":"Gestion de crise","montant":"3 200,00 $"}],"objectives":[{"id":"obj-1","label":"Retirer les lignes sans région","hint":"Cliquez sur la flèche de filtre de la colonne « Région », puis décochez la valeur vide pour ne garder que les lignes avec une région.","demoCaption":"On filtre la colonne Région pour retirer les entrées vides.","stepLabel":"Lignes filtrées","action":{"type":"filterRows","target":"region","params":{"op":"notEquals","value":""}}},{"id":"obj-2","label":"Renommer l'étape","hint":"Dans le volet « Étapes appliquées » à droite, clic droit sur l'étape « Lignes filtrées », choisissez « Renommer » et tapez « Lignes vides retirées ».","demoCaption":"On renomme l'étape pour qu'elle se lise toute seule.","stepLabel":"Lignes vides retirées","action":{"type":"renameStep","params":{"stepIndex":1,"newName":"Lignes vides retirées"}}},{"id":"obj-3","label":"Actualiser avec les ventes de mars","hint":"Cliquez sur le bouton « Actualiser ». Les trois nouvelles lignes de mars 2026 arrivent et toutes les étapes se rejouent automatiquement.","demoCaption":"On actualise : les nouvelles données de mars passent par toute la recette.","stepLabel":"Source actualisée","action":{"type":"refresh","params":{"newRows":[{"representant":"Hugo Bérubé","region":"GAT","formation":"Gestion de crise","montant":"3 200,00 $"},{"representant":"Amélie Fortin","region":"MTL","formation":"Tireur actif","montant":"2 400,00 $"},{"representant":"Sami Khaled","region":"","formation":"Code noir","montant":"1 800,00 $"}]}}}]}},{"id":"06-mini-projet","idx":"6.1","title":"Mini-projet : du fichier brut au rapport propre","durationSeconds":240,"summary":"Mettre en pratique, de façon autonome, tout le cours en transformant un fichier de ventes brut XGuard en rapport propre prêt à présenter.","narration":"[SCENE 1 — OUVERTURE | 0s-28s]\nBienvenue au mini-projet. [pause 600ms] C'est votre défi final. Jusqu'ici, je vous ai guidé étape par étape. Cette fois, vous êtes aux commandes. Je vais quand même vous décrire chaque étape, mais l'objectif, c'est que vous puissiez le refaire seul, sans moi.\n\nLe contexte est simple. On vous remet un fichier de ventes de formations XGuard pour le mois de mars 2026. [pause 400ms] Il est brut. Il y a une colonne inutile, une ligne de total collée au bas, des montants stockés comme du texte, et un mélange de transactions qu'on ne veut pas toutes garder.\n\nVotre mission : partir de ce fichier brut et arriver à un rapport propre, prêt à présenter. [pause 600ms] On y va.\n\n[SCENE 2 — CONNECTER LA SOURCE | 28s-52s]\nPremière étape : on connecte la source. Vous choisissez le fichier Excel comme point de départ. [pause 400ms] Power Query l'ouvre et affiche un aperçu des données.\n\nPrenez le temps de regarder. Vous voyez les noms des représentants, les régions, les montants, les dates, le type de transaction. [pause 400ms] Et vous remarquez déjà les problèmes : une colonne de notes internes qui ne sert à rien, et tout en bas, une ligne TOTAL qui ne devrait pas vivre dans nos données. On va régler tout ça.\n\n[SCENE 3 — PROMOUVOIR LES EN-TETES | 52s-72s]\nDeuxième étape : les en-têtes. La première ligne contient les vrais noms de colonnes, mais Power Query l'affiche encore comme une ligne de données ordinaire. [pause 400ms] Vous utilisez la commande Utiliser la première ligne comme en-têtes.\n\nD'un coup, vos colonnes prennent leurs vrais noms. Représentant, région, montant, date, transaction. [pause 400ms] C'est le réflexe de départ de tout nettoyage. Toujours fixer les en-têtes en premier.\n\n[SCENE 4 — RETIRER LA COLONNE INUTILE | 72s-98s]\nTroisième étape : on enlève le superflu. La colonne Notes internes contient des commentaires qui n'ont pas leur place dans un rapport de ventes. [pause 400ms] Vous la sélectionnez, puis Supprimer les colonnes.\n\nElle disparaît. [pause 400ms] Petit principe que je veux que vous reteniez : une colonne qui ne sert pas au rapport, on la retire tout de suite. Un jeu de données propre, c'est un jeu de données où chaque colonne a une raison d'être. Moins de bruit, plus de clarté.\n\n[SCENE 5 — SUPPRIMER LA LIGNE DE TOTAL | 98s-124s]\nQuatrième étape : la ligne de total. [pause 400ms] Tout en bas du tableau, il y a une ligne TOTAL qui additionne les montants. Dans un fichier Excel, c'est pratique à l'œil. Mais dans Power Query, c'est un piège. Cette ligne n'est pas une vente. Si on la garde, elle va fausser tous nos calculs.\n\nVous utilisez Supprimer les lignes du bas, et vous demandez d'en retirer une seule. [pause 600ms] La ligne TOTAL s'efface. Il ne reste que des vraies transactions. C'est exactement ce qu'on veut.\n\n[SCENE 6 — CONVERTIR LE MONTANT | 124s-152s]\nCinquième étape : le type du montant. [pause 400ms] Regardez la colonne Montant. Les valeurs sont alignées à gauche, avec un signe de dollar et des espaces. Ça veut dire une seule chose : Power Query les voit comme du texte, pas comme des nombres. Et sur du texte, impossible de faire la moindre addition.\n\nVous changez le type de la colonne Montant en nombre décimal. [pause 600ms] Les valeurs s'alignent à droite, le dollar disparaît, et vous avez maintenant des vrais nombres. Votre rapport peut enfin calculer.\n\n[SCENE 7 — FILTRER LES ANNULATIONS | 152s-184s]\nSixième étape : on filtre. [pause 400ms] Dans la colonne Transaction, il y a deux valeurs : Vente et Annulation. Une annulation, ce n'est pas un revenu. Pour un rapport de ventes réelles, on ne veut garder que les ventes.\n\nVous filtrez la colonne Transaction pour ne conserver que les lignes égales à Vente. [pause 600ms] Les annulations disparaissent du tableau. Ce qui reste, ce sont les transactions qui comptent vraiment dans le chiffre d'affaires. [pause 400ms] Filtrer, ce n'est pas effacer des données pour de bon. C'est choisir ce que votre rapport doit montrer.\n\n[SCENE 8 — COLONNE CONDITIONNELLE | 184s-216s]\nSeptième et dernière transformation : une colonne calculée. [pause 400ms] On veut classer chaque vente. Au-dessus de mille dollars, c'est un contrat important. En dessous, c'est une vente standard.\n\nVous créez une colonne conditionnelle nommée Catégorie. La règle : si le montant est supérieur à mille, alors Contrat majeur, sinon Vente standard. [pause 600ms] Une nouvelle colonne apparaît, et chaque ligne se range toute seule dans la bonne catégorie. [pause 400ms] C'est ça, transformer des données brutes en information utile. On ne fait pas juste nettoyer, on ajoute du sens.\n\n[SCENE 9 — CONCLUSION | 216s-240s]\nEt voilà. Regardez votre panneau Étapes appliquées, à droite. [pause 400ms] Source, en-têtes promus, colonne retirée, ligne de total supprimée, type modifié, annulations filtrées, catégorie ajoutée. Sept étapes, dans l'ordre, qui se rejouent automatiquement chaque fois que le fichier change.\n\nVous êtes parti d'un fichier brut et désordonné. Vous arrivez à un rapport propre, fiable, prêt à présenter. [pause 600ms] Et surtout, vous l'avez fait vous-même. C'est exactement la compétence que ce cours voulait vous donner. Félicitations, vous avez terminé.","productionNotes":"Ton : formateur calme, posé, légèrement plus solennel qu'aux leçons précédentes parce que c'est le capstone. Rythme d'environ 150 mots/minute pour tenir 240 secondes. Insister sur le cadrage défi autonome dès la scène 1 (la voix dit explicitement « vous êtes aux commandes »).\n\nCe que l'écran montre, étape par étape, calé sur l'auto-play du simulateur :\n- Scène 1 : titre du mini-projet, puis aperçu du fichier brut complet (colonne Notes internes visible, ligne TOTAL surlignée en bas, montants en texte avec « $ »).\n- Scène 2 : sélecteur de source, choix Excel, table qui se charge. Léger halo sur la colonne Notes et la ligne TOTAL pendant que la voix les pointe.\n- Scène 3 : la 1re ligne monte en en-têtes ; animer le changement de noms de colonnes.\n- Scène 4 : surligner la colonne « notes » puis la faire disparaître ; nouvelle étape « Colonnes supprimées » s'ajoute à droite.\n- Scène 5 : surligner la ligne du bas (TOTAL), puis suppression ; compteur de lignes qui passe de 8 à 7.\n- Scène 6 : colonne Montant, montrer le passage texte (aligné gauche, « $ ») -> décimal (aligné droite). Icône de type ABC -> 1.2.\n- Scène 7 : ouvrir le filtre sur Transaction, décocher Annulation ; lignes d'annulation qui s'effacent (compteur 7 -> 5).\n- Scène 8 : boîte de colonne conditionnelle ; montrer la règle « si Montant > 1000 alors Contrat majeur sinon Vente standard » ; nouvelle colonne Catégorie qui se remplit.\n- Scène 9 : zoom sur le panneau Étapes appliquées avec les 7 étapes nommées ; vue finale du tableau propre.\n\nRéduire la fréquence des légendes d'aide à l'écran par rapport aux leçons précédentes (c'est un défi) : garder les demoCaption courtes, ne pas afficher de flèche pas-à-pas trop appuyée. Sous-titres FR-CA. Vérifier que la voix nomme les étapes dans le même ordre que le panneau « Étapes appliquées ».","quiz":[{"question":"Pourquoi faut-il supprimer la ligne TOTAL avant de faire des calculs dans Power Query?","options":["Parce que Power Query ne peut pas afficher de lignes de total","Parce que cette ligne n'est pas une vraie transaction et fausserait les calculs","Parce qu'elle empêche de promouvoir les en-têtes","Parce qu'elle est toujours en double dans le fichier"],"correctIndex":1,"explanation":"La ligne TOTAL est un sous-total visuel ajouté dans Excel. Ce n'est pas une transaction réelle. Gardée dans les données, elle serait additionnée une deuxième fois et gonflerait tous les calculs."},{"question":"Dans ce mini-projet, pourquoi change-t-on le type de la colonne Montant en nombre décimal?","options":["Pour pouvoir trier la colonne par ordre alphabétique","Pour afficher le signe de dollar automatiquement","Parce que les montants sont du texte et qu'on ne peut pas calculer sur du texte","Pour fusionner la colonne avec la colonne Date"],"correctIndex":2,"explanation":"Tant que les montants restent du texte (alignés à gauche, avec « $ » et des espaces), aucune somme n'est possible. Convertir en décimal en fait de vrais nombres, prêts pour les calculs."},{"question":"Quelle est la bonne règle pour la colonne conditionnelle Catégorie de ce projet?","options":["Si Montant supérieur à 1000, alors Contrat majeur, sinon Vente standard","Si Montant égal à 1000, alors Vente standard, sinon Contrat majeur","Si Région égale MTL, alors Contrat majeur, sinon Vente standard","Si Transaction égale Annulation, alors Contrat majeur, sinon Vente standard"],"correctIndex":0,"explanation":"On classe selon la valeur de la vente : au-dessus de 1000 $, c'est un Contrat majeur; sinon, une Vente standard. La condition porte sur la colonne Montant, pas sur la région ni le type de transaction."}],"downloadableFiles":[{"filename":"mini-projet-depart.xlsx","description":"Fichier de ventes XGuard brut de mars 2026 (colonne Notes internes inutile, ligne TOTAL au bas, montants en texte, annulations mêlées aux ventes) — le point de départ du défi."},{"filename":"mini-projet-solution.xlsx","description":"Version corrigée après les 7 étapes : en-têtes promus, colonne retirée, total supprimé, montants en décimal, annulations filtrées, colonne Catégorie ajoutée — pour comparer votre résultat."}],"scenario":{"id":"06-mini-projet","queryName":"Ventes_Formations_Mars2026","columns":[{"key":"rep","label":"Colonne1","type":"text"},{"key":"region","label":"Colonne2","type":"text"},{"key":"montant","label":"Colonne3","type":"text"},{"key":"date","label":"Colonne4","type":"text"},{"key":"transaction","label":"Colonne5","type":"text"},{"key":"notes","label":"Colonne6","type":"text"}],"rows":[{"rep":"Représentant","region":"Région","montant":"Montant","date":"Date","transaction":"Transaction","notes":"Notes internes"},{"rep":"Julie Tremblay","region":"MTL","montant":"1 450,00 $","date":"2026-03-03","transaction":"Vente","notes":"rappeler client"},{"rep":"Maxime Gagné","region":"QC","montant":"680,00 $","date":"2026-03-05","transaction":"Vente","notes":""},{"rep":"Sophie Bouchard","region":"GAT","montant":"2 300,00 $","date":"2026-03-09","transaction":"Vente","notes":"contrat municipal"},{"rep":"Karim Hadad","region":"MTL","montant":"540,00 $","date":"2026-03-12","transaction":"Annulation","notes":"remboursé"},{"rep":"Julie Tremblay","region":"MTL","montant":"1 200,00 $","date":"2026-03-15","transaction":"Vente","notes":""},{"rep":"Maxime Gagné","region":"QC","montant":"425,00 $","date":"2026-03-18","transaction":"Annulation","notes":"client annulé"},{"rep":"Sophie Bouchard","region":"GAT","montant":"890,00 $","date":"2026-03-22","transaction":"Vente","notes":"renouvellement"},{"montant":"7 485,00 $","total":true}],"objectives":[{"id":"obj-1-source","label":"Connecter la source","hint":"Défi autonome : ouvrez le sélecteur de source et choisissez le fichier Excel comme point de départ.","demoCaption":"On part du fichier Excel brut de mars 2026.","stepLabel":"Source","action":{"type":"chooseSource","params":{"source":"excel"}}},{"id":"obj-2-headers","label":"Promouvoir les en-têtes","hint":"La 1re ligne contient les vrais noms de colonnes : utilisez Utiliser la première ligne comme en-têtes.","demoCaption":"La première ligne devient les en-têtes.","stepLabel":"En-têtes promus","action":{"type":"promoteHeaders"}},{"id":"obj-3-remove-col","label":"Retirer la colonne inutile","hint":"Sélectionnez la colonne Notes internes, puis Supprimer les colonnes.","demoCaption":"On enlève la colonne Notes internes, inutile au rapport.","stepLabel":"Colonnes supprimées","action":{"type":"removeColumn","target":"notes"}},{"id":"obj-4-remove-total","label":"Supprimer la ligne TOTAL","hint":"La ligne de total est tout en bas : Supprimer les lignes du bas, en retirer 1.","demoCaption":"On retire la ligne TOTAL collée au bas du tableau.","stepLabel":"Lignes du bas supprimées","action":{"type":"removeBottomRows","params":{"count":1}}},{"id":"obj-5-type","label":"Convertir le montant","hint":"Colonne Montant : changez le type en nombre décimal pour pouvoir calculer.","demoCaption":"Le montant passe de texte à nombre décimal.","stepLabel":"Type modifié","action":{"type":"changeType","target":"montant","params":{"toType":"decimal"}}},{"id":"obj-6-filter","label":"Filtrer les annulations","hint":"Colonne Transaction : filtrez pour ne garder que les lignes égales à Vente.","demoCaption":"On garde seulement les ventes, pas les annulations.","stepLabel":"Lignes filtrées","action":{"type":"filterRows","target":"transaction","params":{"op":"equals","value":"Vente"}}},{"id":"obj-7-conditional","label":"Classer chaque vente","hint":"Créez une colonne conditionnelle Catégorie : si Montant > 1000 alors Contrat majeur, sinon Vente standard.","demoCaption":"Chaque vente se range en Contrat majeur ou Vente standard.","stepLabel":"Catégorie ajoutée","action":{"type":"conditionalColumn","params":{"newKey":"categorie","label":"Catégorie","ifCol":"montant","op":"greaterThan","value":"1000","thenValue":"Contrat majeur","elseValue":"Vente standard"}}}]}}];
+reviewInit(document.getElementById('rv-root'), REVIEW_DATA);
+})();
+</script>
+</body>
+</html>

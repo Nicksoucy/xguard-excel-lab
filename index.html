@@ -1,0 +1,604 @@
+<!doctype html>
+<html lang="fr-CA">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Simulateur Power Query — XGuard Academy</title>
+<style>
+  body{margin:0;background:#edebe9;font-family:system-ui,-apple-system,'Segoe UI',Roboto,sans-serif;color:#323130}
+  .wrap{max-width:1040px;margin:0 auto;padding:24px 16px 60px}
+  .lede{margin:0 0 18px}
+  .lede h1{font-size:20px;margin:0 0 4px;font-weight:600}
+  .lede p{font-size:13.5px;color:#605e5c;margin:0;line-height:1.5}
+  .foot{font-size:12px;color:#8a8886;margin-top:18px;line-height:1.6}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="lede">
+    <h1>Simulateur Power Query — XGuard Academy</h1>
+    <p>Choisis une leçon, suis l'objectif affiché en bas, ou clique « Mode démo » pour voir la leçon se jouer toute seule. Ce mode démo est exactement ce qui devient la vidéo de démonstration narrée.</p>
+  </div>
+  <div id="pqx-root"></div>
+  <div class="foot">Formation pratique XGuard. Aucune certification officielle Microsoft. Les données sont fictives.</div>
+</div>
+<script>
+(function(){
+// Moteur de transformation du simulateur Power Query — XGuard Academy
+// Fonctions PURES et testables (aucune dépendance, aucun DOM).
+// Modèle « replay » : on garde les données brutes (raw) + l'historique des actions,
+// et on rejoue l'historique pour matérialiser l'état courant. C'est ce qui permet
+// à « Actualiser » (refresh) de ré-exécuter toutes les étapes sur de nouvelles données,
+// exactement comme le vrai Power Query.
+
+function clone(v) {
+  return JSON.parse(JSON.stringify(v));
+}
+
+// Convertit une valeur texte « sale » en nombre. Gère le format québécois :
+// "14 400,00 $" -> 14400.00 ; "10000" -> 10000 ; déjà nombre -> tel quel.
+function parseNumber(v) {
+  if (typeof v === 'number') return v;
+  if (v == null) return NaN;
+  const cleaned = String(v)
+    .replace(/\s/g, '')
+    .replace(/\$/g, '')
+    .replace(/[^\d,.-]/g, '')
+    .replace(',', '.');
+  const n = Number.parseFloat(cleaned);
+  return Number.isNaN(n) ? NaN : n;
+}
+
+const fmtDecimal = new Intl.NumberFormat('fr-CA', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+const fmtInteger = new Intl.NumberFormat('fr-CA', { maximumFractionDigits: 0 });
+
+// Affichage d'une cellule selon le type de sa colonne.
+function formatCell(value, type) {
+  if (value == null || value === '') return '';
+  if (type === 'decimal') {
+    const n = typeof value === 'number' ? value : parseNumber(value);
+    return Number.isNaN(n) ? String(value) : fmtDecimal.format(n);
+  }
+  if (type === 'integer') {
+    const n = typeof value === 'number' ? value : parseNumber(value);
+    return Number.isNaN(n) ? String(value) : fmtInteger.format(n);
+  }
+  return String(value);
+}
+
+function capitalizeWords(s) {
+  return String(s)
+    .toLowerCase()
+    .replace(/(^|[\s'-])([a-zà-ÿ])/g, (m, p1, p2) => p1 + p2.toUpperCase());
+}
+
+function predicate(cellValue, op, value) {
+  switch (op) {
+    case 'equals': return String(cellValue ?? '') === String(value);
+    case 'notEquals': return String(cellValue ?? '') !== String(value);
+    case 'greaterThan': return parseNumber(cellValue) > parseNumber(value);
+    case 'lessThan': return parseNumber(cellValue) < parseNumber(value);
+    default: return false;
+  }
+}
+
+// ---------- application d'UNE action sur {columns, rows} (pur) ----------
+
+function applyOne(columns, rows, action) {
+  const p = action.params || {};
+  switch (action.type) {
+    case 'chooseSource':
+      return { columns, rows };
+
+    case 'promoteHeaders': {
+      if (rows.length === 0) return { columns, rows };
+      const first = rows[0];
+      const newCols = columns.map((c) => ({ ...c, label: String(first[c.key] ?? c.label) }));
+      return { columns: newCols, rows: rows.slice(1) };
+    }
+
+    case 'removeColumn': {
+      const newCols = columns.filter((c) => c.key !== action.target);
+      const newRows = rows.map((r) => {
+        const { [action.target]: _drop, ...rest } = r;
+        return rest;
+      });
+      return { columns: newCols, rows: newRows };
+    }
+
+    case 'removeBottomRows': {
+      const n = Number(p.count) || 1;
+      return { columns, rows: rows.slice(0, Math.max(0, rows.length - n)) };
+    }
+
+    case 'removeEmptyRows': {
+      const newRows = rows.filter((r) => columns.some((c) => String(r[c.key] ?? '').trim() !== ''));
+      return { columns, rows: newRows };
+    }
+
+    case 'changeType': {
+      const newCols = columns.map((c) => (c.key === action.target ? { ...c, type: p.toType } : c));
+      let newRows = rows;
+      if (p.toType === 'decimal' || p.toType === 'integer') {
+        newRows = rows.map((r) => {
+          if (r[action.target] == null || r[action.target] === '') return r;
+          const n = parseNumber(r[action.target]);
+          if (Number.isNaN(n)) return r;
+          return { ...r, [action.target]: p.toType === 'integer' ? Math.round(n) : n };
+        });
+      }
+      return { columns: newCols, rows: newRows };
+    }
+
+    case 'replaceValue': {
+      const newRows = rows.map((r) =>
+        String(r[action.target] ?? '') === String(p.from) ? { ...r, [action.target]: p.to } : r
+      );
+      return { columns, rows: newRows };
+    }
+
+    case 'filterRows': {
+      const newRows = rows.filter((r) => predicate(r[action.target], p.op, p.value));
+      return { columns, rows: newRows };
+    }
+
+    case 'splitColumn': {
+      const idx = columns.findIndex((c) => c.key === action.target);
+      const keys = p.intoKeys || [];
+      const labels = p.intoLabels || keys;
+      const newSubCols = keys.map((k, i) => ({ key: k, label: labels[i] || k, type: 'text' }));
+      const newCols = idx === -1
+        ? columns.concat(newSubCols)
+        : columns.slice(0, idx).concat(newSubCols, columns.slice(idx + 1));
+      const newRows = rows.map((r) => {
+        const parts = String(r[action.target] ?? '').split(p.delimiter);
+        const out = { ...r };
+        delete out[action.target];
+        keys.forEach((k, i) => { out[k] = (parts[i] ?? '').trim(); });
+        return out;
+      });
+      return { columns: newCols, rows: newRows };
+    }
+
+    case 'transformText': {
+      const op = p.op;
+      const newRows = rows.map((r) => {
+        const v = r[action.target];
+        if (v == null) return r;
+        let nv = String(v);
+        if (op === 'trim') nv = nv.trim();
+        else if (op === 'upper') nv = nv.toUpperCase();
+        else if (op === 'lower') nv = nv.toLowerCase();
+        else if (op === 'capitalize') nv = capitalizeWords(nv);
+        return { ...r, [action.target]: nv };
+      });
+      return { columns, rows: newRows };
+    }
+
+    case 'conditionalColumn': {
+      const newCol = { key: p.newKey, label: p.label, type: 'text' };
+      const newCols = columns.concat([newCol]);
+      const newRows = rows.map((r) => ({
+        ...r,
+        [p.newKey]: predicate(r[p.ifCol], p.op, p.value) ? p.thenValue : p.elseValue,
+      }));
+      return { columns: newCols, rows: newRows };
+    }
+
+    case 'appendQuery': {
+      const extra = (p.rows || []).map((r) => clone(r));
+      return { columns, rows: rows.concat(extra) };
+    }
+
+    case 'mergeQuery': {
+      const bring = p.bring || [];
+      const newCols = columns.concat(bring.map((b) => ({ key: b.key, label: b.label, type: 'text' })));
+      const newRows = rows.map((r) => {
+        const out = { ...r };
+        bring.forEach((b) => {
+          const lookup = b.lookup || {};
+          out[b.key] = lookup[String(r[p.keyCol] ?? '')] ?? '';
+        });
+        return out;
+      });
+      return { columns: newCols, rows: newRows };
+    }
+
+    default:
+      return { columns, rows };
+  }
+}
+
+// Rejoue tout l'historique d'actions sur les données brutes.
+function replay(raw, history) {
+  let columns = clone(raw.columns);
+  let rows = clone(raw.rows);
+  for (const action of history) {
+    const res = applyOne(columns, rows, action);
+    columns = res.columns;
+    rows = res.rows;
+  }
+  return { columns, rows };
+}
+
+// ---------- état de plus haut niveau (matérialisé + historique + étapes) ----------
+
+function initState(scenario) {
+  const raw = { columns: clone(scenario.columns), rows: clone(scenario.rows) };
+  return {
+    source: scenario.preSource || null,
+    raw,
+    history: [],
+    columns: clone(scenario.columns),
+    rows: clone(scenario.rows),
+    steps: [{ name: 'Source' }],
+    refreshedAt: 0,
+  };
+}
+
+function defaultStep(type) {
+  const map = {
+    promoteHeaders: 'En-têtes promus',
+    removeColumn: 'Colonnes supprimées',
+    removeBottomRows: 'Lignes du bas supprimées',
+    removeEmptyRows: 'Lignes vides supprimées',
+    changeType: 'Type modifié',
+    replaceValue: 'Valeur remplacée',
+    filterRows: 'Lignes filtrées',
+    splitColumn: 'Colonne fractionnée',
+    transformText: 'Texte transformé',
+    conditionalColumn: 'Colonne conditionnelle ajoutée',
+    appendQuery: 'Requêtes ajoutées',
+    mergeQuery: 'Requêtes fusionnées',
+  };
+  return map[type] || 'Étape';
+}
+
+function applyAction(state, action) {
+  if (action.type === 'renameStep') {
+    const i = action.params.stepIndex;
+    const steps = state.steps.map((s, k) => (k === i ? { ...s, name: action.params.newName } : s));
+    return { ...state, steps };
+  }
+
+  if (action.type === 'refresh') {
+    const newRows = (action.params && action.params.newRows) || [];
+    const raw = { columns: state.raw.columns, rows: state.raw.rows.concat(newRows.map((r) => clone(r))) };
+    const cur = replay(raw, state.history);
+    return { ...state, raw, columns: cur.columns, rows: cur.rows, refreshedAt: state.refreshedAt + 1 };
+  }
+
+  if (action.type === 'chooseSource') {
+    const history = state.history.concat([action]);
+    return { ...state, source: action.params.source, history };
+  }
+
+  const history = state.history.concat([action]);
+  const cur = replay(state.raw, history);
+  const stepName = action.stepLabel || defaultStep(action.type);
+  const steps = state.steps.concat([{ name: stepName }]);
+  return { ...state, history, columns: cur.columns, rows: cur.rows, steps };
+}
+
+// ---------- validation : l'action du participant correspond-elle à l'objectif ? ----------
+
+function matchAction(performed, expected) {
+  if (!performed || !expected || performed.type !== expected.type) return false;
+  const pp = performed.params || {};
+  const ep = expected.params || {};
+  switch (expected.type) {
+    case 'chooseSource': return pp.source === ep.source;
+    case 'promoteHeaders': return true;
+    case 'removeColumn': return performed.target === expected.target;
+    case 'removeBottomRows': return Number(pp.count || 1) === Number(ep.count || 1);
+    case 'removeEmptyRows': return true;
+    case 'changeType': return performed.target === expected.target && pp.toType === ep.toType;
+    case 'replaceValue':
+      return performed.target === expected.target && String(pp.from) === String(ep.from) && String(pp.to) === String(ep.to);
+    case 'filterRows':
+      return performed.target === expected.target && pp.op === ep.op && String(pp.value) === String(ep.value);
+    case 'splitColumn': return performed.target === expected.target && pp.delimiter === ep.delimiter;
+    case 'transformText': return performed.target === expected.target && pp.op === ep.op;
+    case 'conditionalColumn': return pp.newKey === ep.newKey && pp.ifCol === ep.ifCol;
+    case 'appendQuery': return true;
+    case 'mergeQuery': return pp.keyCol === ep.keyCol;
+    case 'refresh': return true;
+    case 'renameStep': return Number(pp.stepIndex) === Number(ep.stepIndex);
+    default: return false;
+  }
+}
+
+// Interface du simulateur Power Query — XGuard Academy
+// Couche d'affichage (DOM). S'appuie sur les fonctions pures de transforms.mjs
+// (initState, applyAction, matchAction, formatCell) qui sont concaténées avant ce
+// fichier au moment du build. SCENARIOS est injecté par le build.
+// Pas de dépendance externe, pas de police d'icônes : tout est en CSS.
+
+function pqxInit(root, scenarios) {
+  const C = {
+    green: '#217346', greenDark: '#1a5c38', bg: '#faf9f8', panel: '#f3f2f1',
+    border: '#e1dfdd', border2: '#c8c6c4', text: '#323130', muted: '#605e5c',
+    sel: '#c7e0d4', selBg: '#edf6f1', warn: '#8a6d00', warnBg: '#fff8e6',
+    ok: '#0b6a0b', okBg: '#e9f6e9', rec: '#d13438',
+  };
+  const style = document.createElement('style');
+  style.textContent = `
+  .pqx-app{font-family:system-ui,-apple-system,'Segoe UI',Roboto,sans-serif;color:${C.text};border:1px solid ${C.border2};border-radius:8px;overflow:hidden;background:#fff;max-width:1000px}
+  .pqx-top{border-top:3px solid ${C.green};background:${C.panel};border-bottom:1px solid ${C.border};padding:10px 14px;display:flex;align-items:center;gap:12px;flex-wrap:wrap}
+  .pqx-top b{font-weight:600}
+  .pqx-sel{font-size:13px;padding:6px 8px;border:1px solid ${C.border2};border-radius:6px;background:#fff;color:${C.text}}
+  .pqx-obj-sum{font-size:12.5px;color:${C.muted};flex:1;min-width:180px}
+  .pqx-tabs{display:flex;gap:18px;padding:6px 14px 0;background:#fff;border-bottom:1px solid ${C.border};font-size:13px}
+  .pqx-tabs span{padding:6px 2px;color:${C.muted}}
+  .pqx-tabs span.on{color:${C.text};border-bottom:2px solid ${C.green};font-weight:600}
+  .pqx-tools{position:relative;display:flex;gap:6px;padding:8px 14px;background:${C.bg};border-bottom:1px solid ${C.border};flex-wrap:wrap;align-items:center}
+  .pqx-btn{font-size:12px;padding:7px 10px;border:1px solid ${C.border2};border-radius:6px;background:#fff;cursor:pointer;color:${C.text};line-height:1.2}
+  .pqx-btn:hover{background:${C.panel}}
+  .pqx-btn:disabled{opacity:.45;cursor:default}
+  .pqx-selind{margin-left:auto;font-size:12px;color:${C.muted}}
+  .pqx-selind b{color:${C.text}}
+  .pqx-grpsep{width:1px;align-self:stretch;background:${C.border2};margin:0 4px}
+  .pqx-load{display:inline-flex;align-items:center;gap:6px;font-size:12px;padding:7px 11px;border:1px solid ${C.greenDark};border-radius:6px;background:${C.green};color:#fff;cursor:pointer;font-weight:500}
+  .pqx-fx{display:flex;align-items:center;gap:8px;padding:5px 14px;background:#fff;border-bottom:1px solid ${C.border};font-size:12px}
+  .pqx-fx .fxi{font-style:italic;font-weight:700;color:${C.greenDark};border:1px solid ${C.border2};border-radius:4px;padding:0 8px;line-height:18px}
+  .pqx-fx .fxv{flex:1;color:${C.text};white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+  .pqx-status{display:flex;gap:18px;padding:6px 14px;background:${C.panel};border-top:1px solid ${C.border};font-size:11.5px;color:${C.muted}}
+  .pqx-q .qcur{background:${C.green};color:#fff}
+  .pqx-menu{position:absolute;z-index:40;background:#fff;border:1px solid ${C.border2};border-radius:6px;box-shadow:0 4px 14px rgba(0,0,0,.12);min-width:210px;padding:4px}
+  .pqx-menu .mi{padding:8px 10px;border-radius:5px;font-size:13px;cursor:pointer}
+  .pqx-menu .mi:hover{background:${C.selBg}}
+  .pqx-body{display:grid;grid-template-columns:120px minmax(0,1fr) 210px}
+  .pqx-q{border-right:1px solid ${C.border};padding:10px 8px}
+  .pqx-q .h{font-size:11px;color:${C.muted};text-transform:uppercase;letter-spacing:.04em;margin-bottom:6px}
+  .pqx-q .item{display:flex;align-items:center;gap:6px;font-size:12.5px;padding:6px 7px;border-radius:5px;background:${C.selBg};color:${C.greenDark}}
+  .pqx-gridwrap{overflow-x:auto}
+  table.pqx-grid{border-collapse:collapse;width:100%;min-width:520px}
+  table.pqx-grid th{position:relative;text-align:left;font-weight:600;font-size:12px;padding:6px 10px;white-space:nowrap;border:1px solid ${C.border};background:${C.panel};cursor:pointer;user-select:none}
+  table.pqx-grid th.sel{background:${C.sel};outline:2px solid ${C.green};outline-offset:-2px}
+  table.pqx-grid th .ty{display:inline-block;min-width:24px;font-size:10.5px;color:${C.muted};font-weight:400}
+  table.pqx-grid td{font-size:12px;padding:5px 10px;white-space:nowrap;border:1px solid ${C.border}}
+  table.pqx-grid td.num{text-align:right;font-variant-numeric:tabular-nums}
+  table.pqx-grid tr.tot td{color:${C.muted};font-style:italic;background:${C.panel}}
+  .pqx-props{border-left:1px solid ${C.border};padding:10px 10px}
+  .pqx-props .h{font-size:11px;color:${C.muted};text-transform:uppercase;letter-spacing:.04em;margin:0 0 5px}
+  .pqx-props .nm{font-size:12.5px;color:${C.muted};margin-bottom:12px}
+  .pqx-props .nm b{color:${C.text}}
+  .pqx-step{display:flex;align-items:center;gap:7px;font-size:12px;padding:5px 8px;border-radius:5px;border:1px solid ${C.border};margin-bottom:3px}
+  .pqx-step.cur{background:${C.selBg};border-color:${C.sel}}
+  .pqx-step .dot{width:7px;height:7px;border-radius:50%;background:${C.green};flex:none}
+  .pqx-coach{padding:12px 14px;border-top:1px solid ${C.border};background:${C.panel}}
+  .pqx-chips{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:9px}
+  .pqx-chip{display:inline-flex;align-items:center;gap:6px;font-size:12px;padding:4px 10px;border-radius:999px;border:1px solid ${C.border2};color:${C.muted}}
+  .pqx-chip.done{background:${C.okBg};color:${C.ok};border-color:${C.okBg}}
+  .pqx-chip .mark{font-weight:700}
+  .pqx-msg{font-size:13px;color:${C.muted};min-height:20px;line-height:1.5}
+  .pqx-actions{display:flex;gap:8px;margin-top:11px;flex-wrap:wrap}
+  .pqx-act{font-size:12.5px;padding:8px 13px;border:1px solid ${C.border2};border-radius:6px;background:#fff;cursor:pointer;color:${C.text}}
+  .pqx-act:hover{background:${C.bg}}
+  .pqx-act.primary{border-color:${C.green};color:${C.greenDark}}
+  .pqx-dlg input{font-size:13px;padding:6px 8px;border:1px solid ${C.border2};border-radius:5px}
+  `;
+  root.appendChild(style);
+  const app = document.createElement('div');
+  app.className = 'pqx-app';
+  root.appendChild(app);
+
+  // ---- état runtime ----
+  let scIndex = 0;
+  let st = null;
+  let completed = 0;
+  let sel = null;
+  let playing = false;
+  let shotMode = false;  // mode capture d'écran (cache la barre pédagogique → look Excel pur)
+
+  const NEEDS_COL = new Set(['removeColumn', 'changeType', 'replaceValue', 'filterRows', 'splitColumn', 'transformText']);
+  const BTN = {
+    chooseSource: 'Choisir la source ▾', promoteHeaders: 'Utiliser la 1re ligne comme en-têtes',
+    removeColumn: 'Supprimer les colonnes', removeBottomRows: 'Supprimer les lignes du bas',
+    removeEmptyRows: 'Supprimer les lignes vides', changeType: 'Type de données ▾',
+    replaceValue: 'Remplacer les valeurs', filterRows: 'Filtrer la colonne',
+    splitColumn: 'Fractionner la colonne', transformText: 'Format du texte ▾',
+    conditionalColumn: 'Colonne conditionnelle', appendQuery: 'Ajouter (empiler)',
+    mergeQuery: 'Fusionner les requêtes', refresh: 'Actualiser', renameStep: 'Renommer l\'étape',
+  };
+  const TYPE_MENU = [
+    { label: 'Texte', value: 'text' }, { label: 'Nombre entier', value: 'integer' },
+    { label: 'Nombre décimal', value: 'decimal' }, { label: 'Date', value: 'date' },
+  ];
+  const TEXT_MENU = [
+    { label: 'Supprimer les espaces', value: 'trim' }, { label: 'MAJUSCULES', value: 'upper' },
+    { label: 'minuscules', value: 'lower' }, { label: 'Majuscule à chaque mot', value: 'capitalize' },
+  ];
+  const SOURCE_MENU = [
+    { label: 'Classeur Excel', value: 'excel' }, { label: 'Fichier texte / CSV', value: 'csv' },
+    { label: 'Dossier', value: 'dossier' },
+  ];
+
+  function curObj() { const o = st.scenarioObjectives; return completed < o.length ? o[completed] : null; }
+  function labelOf(key) { const c = st.columns.find((c) => c.key === key); return c ? c.label : key; }
+  function ribbonTypes() {
+    const seen = []; for (const o of st.scenarioObjectives) if (!seen.includes(o.action.type)) seen.push(o.action.type);
+    return seen;
+  }
+
+  function loadScenario(i) {
+    scIndex = i;
+    const s = scenarios[i].scenario;
+    st = initState(s);
+    st.scenarioObjectives = s.objectives;
+    completed = 0; sel = null; playing = false;
+    closeMenus();
+    render();
+    coachHint();
+    renderActions();
+  }
+
+  function render() {
+    const numericTypes = new Set(['decimal', 'integer']);
+    const selOptions = scenarios.map((s, i) => `<option value="${i}"${i === scIndex ? ' selected' : ''}>Leçon ${s.lessonIndex} — ${esc(s.title)}</option>`).join('');
+    const tools = ribbonTypes().map((t) => `<button class="pqx-btn" data-act="${t}">${BTN[t]}</button>`).join('');
+    const head = st.columns.map((c) => {
+      const on = sel === c.key;
+      const ty = c.type === 'decimal' ? '1.2' : c.type === 'integer' ? '123' : c.type === 'date' ? '📅' : 'ABC';
+      return `<th data-k="${c.key}"${on ? ' class="sel"' : ''}><span class="ty">${ty}</span>${esc(c.label)}</th>`;
+    }).join('');
+    const body = st.rows.map((r) => {
+      const tot = r.total ? ' class="tot"' : '';
+      const tds = st.columns.map((c) => {
+        const num = numericTypes.has(c.type);
+        return `<td${num ? ' class="num"' : ''}>${esc(formatCell(r[c.key], c.type))}</td>`;
+      }).join('');
+      return `<tr${tot}>${tds}</tr>`;
+    }).join('');
+    const steps = st.steps.map((s, i) => `<div class="pqx-step${i === st.steps.length - 1 ? ' cur' : ''}"><span class="dot"></span>${esc(s.name)}</div>`).join('');
+    const chips = st.scenarioObjectives.map((o, i) => `<span class="pqx-chip${i < completed ? ' done' : ''}"><span class="mark">${i < completed ? '✓' : '○'}</span>${esc(o.label)}</span>`).join('');
+    const sc = scenarios[scIndex];
+
+    app.innerHTML = `
+    <div class="pqx-top"><b style="color:${C.greenDark}">Éditeur Power Query</b>${shotMode ? `<span style="font-size:12.5px;color:${C.muted}">${esc(scenarios[scIndex].scenario.queryName)}</span>` : `<select class="pqx-sel" id="pqx-lesson">${selOptions}</select><span class="pqx-obj-sum">${esc(sc.summary || '')}</span>`}</div>
+    <div class="pqx-tabs"><span class="on">Accueil</span><span>Transformer</span><span>Ajouter une colonne</span><span>Affichage</span></div>
+    <div class="pqx-tools" id="pqx-tools"><button class="pqx-load">▣ Fermer et charger</button><span class="pqx-grpsep"></span>${tools}<span class="pqx-selind">Colonne sélectionnée : <b id="pqx-selname">${sel ? esc(labelOf(sel)) : '—'}</b></span></div>
+    <div class="pqx-fx"><span class="fxi">fx</span><span class="fxv">= ${esc(st.steps.length ? st.steps[st.steps.length - 1].name : 'Source')}</span></div>
+    <div class="pqx-body">
+      <div class="pqx-q"><div class="h">Requêtes [1]</div><div class="item qcur">▦ ${esc(scenarios[scIndex].scenario.queryName)}</div></div>
+      <div class="pqx-gridwrap"><table class="pqx-grid"><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table></div>
+      <div class="pqx-props"><div class="h">Propriétés</div><div class="nm">Nom : <b>${esc(scenarios[scIndex].scenario.queryName)}</b></div><div class="h">Étapes appliquées</div>${steps}</div>
+    </div>
+    <div class="pqx-status"><span>${st.columns.length} colonnes, ${st.rows.length} lignes</span><span>${st.steps.length} étape(s) appliquée(s)</span><span style="margin-left:auto">Aperçu — données fictives XGuard</span></div>
+    ${shotMode ? '' : `<div class="pqx-coach">
+      <div class="pqx-chips">${chips}</div>
+      <div class="pqx-msg" id="pqx-msg"></div>
+      <div class="pqx-actions" id="pqx-actions"></div>
+    </div>`}`;
+
+    const lessonSel = app.querySelector('#pqx-lesson'); if (lessonSel) lessonSel.onchange = (e) => loadScenario(Number(e.target.value));
+    app.querySelectorAll('table.pqx-grid th').forEach((th) => { th.onclick = () => { if (!playing) { sel = th.getAttribute('data-k'); render(); coachHint(); renderActions(); } }; });
+    app.querySelectorAll('#pqx-tools .pqx-btn').forEach((b) => { b.onclick = () => onCommand(b.getAttribute('act') || b.getAttribute('data-act'), b); });
+  }
+
+  function esc(s) { return String(s == null ? '' : s).replace(/[&<>"]/g, (m) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[m])); }
+  function msg(html) { const m = app.querySelector('#pqx-msg'); if (m) m.innerHTML = html; }
+  function coachHint() {
+    const o = curObj();
+    if (!o) { success(); return; }
+    msg(`<span style="color:${C.text}"><b>Objectif :</b> ${esc(o.hint)}</span>`);
+  }
+  function warn(t) { msg(`<span style="color:${C.warn}">⚠ ${esc(t)}</span>`); }
+
+  function renderActions(done) {
+    const a = app.querySelector('#pqx-actions'); if (!a) return;
+    let html = '<button class="pqx-act" id="pqx-demo">▶ Mode démo (joue tout seul)</button><button class="pqx-act" id="pqx-reset">↺ Recommencer</button>';
+    if (done) html += '<button class="pqx-act primary" id="pqx-video">Comment ça devient une vidéo ?</button>';
+    a.innerHTML = html;
+    a.querySelector('#pqx-demo').onclick = autoPlay;
+    a.querySelector('#pqx-reset').onclick = () => loadScenario(scIndex);
+    if (done && a.querySelector('#pqx-video')) a.querySelector('#pqx-video').onclick = () => { if (typeof sendPrompt === 'function') sendPrompt('Explique comment cette simulation auto-jouée devient la vidéo de démo narrée.'); };
+  }
+
+  function onCommand(type, btn) {
+    if (playing) return;
+    closeMenus();
+    const o = curObj();
+    if (!o) return;
+    // commandes à menu
+    if (type === 'changeType') { needColThen(o, type, () => openMenu(btn, TYPE_MENU, (v) => pick(o, type, { toType: v }, v === o.action.params.toType, 'Choisis « Nombre décimal » pour un montant, ou le bon type attendu.'))); return; }
+    if (type === 'transformText') { needColThen(o, type, () => openMenu(btn, TEXT_MENU, (v) => pick(o, type, { op: v }, v === o.action.params.op, 'Ce n\'est pas la mise en forme attendue ici.'))); return; }
+    if (type === 'chooseSource') { openMenu(btn, SOURCE_MENU, (v) => pick(o, type, { source: v }, type === o.action.type && v === o.action.params.source, 'Ce n\'est pas la bonne source pour ce fichier.')); return; }
+    // commandes directes
+    if (type !== o.action.type) { warn('Ce n\'est pas l\'étape attendue maintenant. ' + o.hint); return; }
+    if (NEEDS_COL.has(type)) {
+      if (sel !== o.action.target) { warn('Sélectionne d\'abord la colonne « ' + labelOf(o.action.target) + ' » en cliquant son en-tête.'); return; }
+    }
+    apply(o);
+  }
+
+  function needColThen(o, type, fn) {
+    if (type !== o.action.type) { warn('Ce n\'est pas l\'étape attendue maintenant. ' + o.hint); return; }
+    if (NEEDS_COL.has(type) && sel !== o.action.target) { warn('Sélectionne d\'abord la colonne « ' + labelOf(o.action.target) + ' » en cliquant son en-tête.'); return; }
+    fn();
+  }
+  function pick(o, type, params, okMatch, badMsg) {
+    closeMenus();
+    if (type !== o.action.type) { warn('Ce n\'est pas l\'étape attendue maintenant. ' + o.hint); return; }
+    if (!okMatch) { warn(badMsg); return; }
+    apply(o);
+  }
+
+  function apply(o) {
+    const performed = Object.assign({}, o.action, { stepLabel: o.stepLabel });
+    if (!matchAction(performed, o.action)) { warn('Action incohérente.'); return; }
+    st0apply(performed);
+    completed += 1; sel = null;
+    render();
+    if (!curObj()) success(); else { coachHint(); renderActions(); }
+  }
+  function st0apply(performed) {
+    const objs = st.scenarioObjectives;
+    st = applyAction(st, performed);
+    st.scenarioObjectives = objs;
+  }
+
+  function success() {
+    render();
+    msg(`<span style="color:${C.ok}"><b>✓ Bravo.</b> Données prêtes. Ces ${st.scenarioObjectives.length} étapes, jouées toutes seules, deviennent la vidéo de démo narrée — et elles se rejoueront sur les données du mois prochain en un clic.</span>`);
+    renderActions(true);
+    const id = scenarios[scIndex].lessonId, idx = scenarios[scIndex].lessonIndex;
+    try { if (typeof window !== 'undefined' && typeof window.onPqxComplete === 'function') window.onPqxComplete(id, idx); } catch (e) {}
+    try { if (typeof window !== 'undefined' && window.parent) window.parent.postMessage({ type: 'pqx-lesson-complete', lessonId: id, lessonIndex: idx }, '*'); } catch (e) {}
+  }
+
+  // ---- menus ----
+  function closeMenus() { app.querySelectorAll('.pqx-menu').forEach((m) => m.remove()); }
+  function openMenu(btn, items, onPick) {
+    closeMenus();
+    const tools = app.querySelector('#pqx-tools');
+    const d = document.createElement('div'); d.className = 'pqx-menu';
+    d.style.left = btn.offsetLeft + 'px'; d.style.top = (btn.offsetTop + btn.offsetHeight + 4) + 'px';
+    items.forEach((it) => { const e = document.createElement('div'); e.className = 'mi'; e.textContent = it.label; e.onclick = (ev) => { ev.stopPropagation(); onPick(it.value); }; d.appendChild(e); });
+    tools.appendChild(d);
+  }
+  app.addEventListener('click', (e) => { if (!e.target.closest('.pqx-menu') && !e.target.closest('.pqx-btn')) closeMenus(); });
+
+  // ---- mode démo (auto-play) ----
+  function autoPlay() {
+    loadScenario(scIndex); playing = true; closeMenus(); renderActions();
+    const objs = st.scenarioObjectives; let i = 0;
+    function tick() {
+      if (i >= objs.length) { playing = false; success(); return; }
+      const o = objs[i++];
+      if (NEEDS_COL.has(o.action.type)) { sel = o.action.target; render(); }
+      msg(`<span style="color:${C.text}"><span style="color:${C.rec}">●</span> ${esc(o.demoCaption)}</span>`);
+      setTimeout(() => { st0apply(Object.assign({}, o.action, { stepLabel: o.stepLabel })); completed = i; sel = null; render(); msg(`<span style="color:${C.text}"><span style="color:${C.rec}">●</span> ${esc(o.demoCaption)}</span>`); setTimeout(tick, 800); }, 1100);
+    }
+    tick();
+  }
+
+  // Lien profond : ?lecon=2.1 (ou l'identifiant de leçon) pré-sélectionne la leçon — utile pour
+  // pointer une leçon précise depuis GoHighLevel.
+  let startIdx = 0, shotSteps = 0;
+  try {
+    const q = new URLSearchParams(typeof location !== 'undefined' ? location.search : '');
+    const lec = q.get('lecon');
+    if (lec) { const k = scenarios.findIndex((s) => s.lessonIndex === lec || s.lessonId === lec); if (k >= 0) startIdx = k; }
+    shotMode = q.get('shot') === '1';
+    shotSteps = Math.max(0, parseInt(q.get('steps') || '0', 10) || 0);
+  } catch (e) {}
+  loadScenario(startIdx);
+  // Mode capture : applique les N premières étapes immédiatement et sélectionne la colonne
+  // de la prochaine étape, pour photographier l'éditeur à chaque stade de la transformation.
+  if (shotSteps > 0) {
+    const objs = st.scenarioObjectives;
+    for (let i = 0; i < shotSteps && i < objs.length; i++) st0apply(Object.assign({}, objs[i].action, { stepLabel: objs[i].stepLabel }));
+    completed = Math.min(shotSteps, objs.length);
+    const nextO = completed < objs.length ? objs[completed] : null;
+    if (nextO && NEEDS_COL.has(nextO.action.type)) sel = nextO.action.target;
+    render();
+  }
+}
+
+var SCENARIOS = [{"lessonId":"01-charger-donnees","lessonIndex":"1.1","title":"Charger et reconnaître ses données","summary":"Importer un fichier CSV brut dans une requête Power Query et promouvoir la première ligne en en-têtes, tout en comprenant que charger n'est pas coller dans la feuille.","scenario":{"id":"01-charger-donnees","queryName":"VentesFormations","columns":[{"key":"date","label":"Colonne1","type":"text"},{"key":"representant","label":"Colonne2","type":"text"},{"key":"region","label":"Colonne3","type":"text"},{"key":"formation","label":"Colonne4","type":"text"},{"key":"montant","label":"Colonne5","type":"text"}],"rows":[{"date":"Date","representant":"Représentant","region":"Région","formation":"Formation","montant":"Montant"},{"date":"2026-06-02","representant":"Mélanie Tremblay","region":"MTL","formation":"Tireur actif","montant":"14 400,00 $"},{"date":"2026-06-04","representant":"Karim Benali","region":"QC","formation":"Code noir","montant":"9 600,00 $"},{"date":"2026-06-07","representant":"Joanie Lévesque","region":"GAT","formation":"Gestion de crise","montant":"7 200,00 $"},{"date":"2026-06-11","representant":"Mélanie Tremblay","region":"MTL","formation":"Agent de gardiennage","montant":"12 000,00 $"},{"date":"2026-06-15","representant":"David Côté","region":"QC","formation":"Tireur actif","montant":"14 400,00 $"},{"date":"2026-06-18","representant":"Karim Benali","region":"GAT","formation":"Code noir","montant":"9 600,00 $"}],"objectives":[{"id":"obj-1-source","label":"Choisir la source CSV","hint":"Cliquez sur Obtenir les données, puis À partir d'un fichier texte ou CSV, et choisissez le type de source « csv ».","demoCaption":"On pointe vers le fichier CSV brut. Power Query ouvre un aperçu, pas une copie.","stepLabel":"Source","action":{"type":"chooseSource","params":{"source":"csv"}}},{"id":"obj-2-headers","label":"Promouvoir les en-têtes","hint":"La première ligne contient déjà vos titres. Cliquez sur « Utiliser la première ligne comme en-tête » pour qu'elle serve de noms de colonnes.","demoCaption":"On promeut la première ligne : Date, Représentant, Région, Formation et Montant deviennent les noms de colonnes.","stepLabel":"En-têtes promus","action":{"type":"promoteHeaders"}}]}},{"lessonId":"02-nettoyer","lessonIndex":"2.1","title":"Nettoyer un fichier de ventes brut","summary":"Nettoyer un fichier de ventes brut en retirant une colonne inutile, la ligne de total, en corrigeant le type du montant et en normalisant le code de région.","scenario":{"id":"02-nettoyer","queryName":"Ventes_formations_brut","columns":[{"key":"source","label":"Source","type":"text"},{"key":"date","label":"Date","type":"date"},{"key":"rep","label":"Représentant","type":"text"},{"key":"region","label":"Région","type":"text"},{"key":"produit","label":"Produit","type":"text"},{"key":"qte","label":"Qté","type":"integer"},{"key":"montant","label":"Montant","type":"text"}],"rows":[{"source":"import_2026","date":"2026-01-12","rep":"Marie-Pier Tremblay","region":"QC","produit":"Tireur actif","qte":"12","montant":"14 400,00 $"},{"source":"import_2026","date":"2026-01-19","rep":"Sébastien Gagnon","region":"MTL","produit":"Code noir","qte":"8","montant":"9 600,00 $"},{"source":"import_2026","date":"2026-02-03","rep":"Marie-Pier Tremblay","region":"GAT","produit":"Gestion de crise","qte":"5","montant":"6 250,00 $"},{"source":"import_2026","date":"2026-02-14","rep":"Karine Bouchard","region":"QC","produit":"Tireur actif","qte":"15","montant":"18 000,00 $"},{"source":"import_2026","date":"2026-03-02","rep":"Sébastien Gagnon","region":"MTL","produit":"Espace clos","qte":"10","montant":"13 500,00 $"},{"source":"import_2026","date":"2026-03-18","rep":"Karine Bouchard","region":"QC","produit":"Code noir","qte":"6","montant":"7 200,00 $"},{"source":"import_2026","date":"2026-03-27","rep":"Yannick Lévesque","region":"GAT","produit":"Gestion de crise","qte":"9","montant":"11 250,00 $"},{"source":"","date":"","rep":"","region":"","produit":"TOTAL","qte":"65","montant":"80 200,00 $","total":true}],"objectives":[{"id":"obj-1-remove-source","label":"Retirer la colonne source","hint":"Sélectionnez l'en-tête de la colonne Source, faites un clic droit, puis choisissez Supprimer.","demoCaption":"On enlève la colonne source : c'est juste une trace d'export, elle n'apprend rien sur les ventes.","stepLabel":"Colonnes supprimées","action":{"type":"removeColumn","target":"source"}},{"id":"obj-2-remove-total","label":"Enlever la ligne TOTAL","hint":"Ouvrez Supprimer des lignes, puis Supprimer les dernières lignes, et indiquez 1 ligne.","demoCaption":"La dernière ligne est un TOTAL, pas une vente. On retire la ligne du bas pour ne garder que des vraies ventes.","stepLabel":"Lignes inférieures supprimées","action":{"type":"removeBottomRows","params":{"count":1}}},{"id":"obj-3-montant-decimal","label":"Montant en nombre décimal","hint":"Cliquez l'icône de type à gauche de l'en-tête Montant, puis choisissez Nombre décimal.","demoCaption":"Le montant est en texte. On le passe en nombre décimal pour pouvoir l'additionner.","stepLabel":"Type modifié","action":{"type":"changeType","target":"montant","params":{"toType":"decimal"}}},{"id":"obj-4-region-quebec","label":"QC devient Québec","hint":"Sélectionnez la colonne Région, ouvrez Remplacer les valeurs, remplacez QC par Québec.","demoCaption":"On remplace le code QC par le mot complet Québec, pour un rapport lisible par un humain.","stepLabel":"Valeur remplacée","action":{"type":"replaceValue","target":"region","params":{"from":"QC","to":"Québec"}}}]}},{"lessonId":"03-transformer","lessonIndex":"3.1","title":"Fractionner, mettre en forme, enrichir","summary":"Apprendre à fractionner une colonne, normaliser le texte et créer une colonne conditionnelle pour produire des colonnes propres et réutilisables dans Power Query.","scenario":{"id":"03-transformer","queryName":"Ventes_formations_agents","columns":[{"key":"agent","label":"Agent","type":"text"},{"key":"region","label":"Région","type":"text"},{"key":"montant","label":"Montant ventes","type":"decimal"},{"key":"date","label":"Date","type":"date"}],"rows":[{"agent":"Tremblay, Marie","region":"MTL","montant":"14400.00","date":"2026-02-12"},{"agent":"Gagnon, jean","region":"QC","montant":"8200.00","date":"2026-02-18"},{"agent":"Bouchard, SOPHIE","region":"GAT","montant":"21750.00","date":"2026-03-03"},{"agent":"Roy, david","region":"MTL","montant":"9650.00","date":"2026-03-09"},{"agent":"Lavoie, NATHALIE","region":"QC","montant":"17300.00","date":"2026-03-21"},{"agent":"Fortin, marc","region":"GAT","montant":"6900.00","date":"2026-04-02"},{"agent":"Pelletier, Isabelle","region":"MTL","montant":"12500.00","date":"2026-04-15"}],"objectives":[{"id":"obj-1-split-agent","label":"Fractionner la colonne Agent","hint":"Sélectionnez la colonne Agent, puis Transformer > Fractionner la colonne > Par délimiteur, avec le délimiteur virgule-espace.","demoCaption":"On coupe le nom collé en deux colonnes : Nom et Prénom.","stepLabel":"Colonne fractionnée","action":{"type":"splitColumn","target":"agent","params":{"delimiter":", ","intoKeys":["nom","prenom"],"intoLabels":["Nom","Prénom"]}}},{"id":"obj-2-format-prenom","label":"Mettre le Prénom en forme","hint":"Sélectionnez la colonne Prénom, puis Transformer > Format > Mettre en majuscule chaque mot.","demoCaption":"On uniformise le prénom : première lettre en majuscule, le reste en minuscules.","stepLabel":"Texte mis en forme","action":{"type":"transformText","target":"prenom","params":{"op":"capitalize"}}},{"id":"obj-3-categorie-conditionnelle","label":"Créer la colonne Catégorie","hint":"Ajouter une colonne > Colonne conditionnelle : si Montant > 10000 alors Grand compte, sinon Standard.","demoCaption":"On classe chaque agent automatiquement selon son montant de ventes.","stepLabel":"Colonne conditionnelle ajoutée","action":{"type":"conditionalColumn","params":{"newKey":"categorie","label":"Catégorie","ifCol":"montant","op":"greaterThan","value":"10000","thenValue":"Grand compte","elseValue":"Standard"}}}]}},{"lessonId":"04-combiner","lessonIndex":"4.1","title":"Empiler et fusionner des tables","summary":"Apprendre à combiner deux tables : empiler les ventes de février sous celles de janvier, puis fusionner avec la table des représentants pour ramener le superviseur par la clé.","scenario":{"id":"04-combiner","queryName":"Ventes_Formations_2026","columns":[{"key":"rep","label":"Représentant","type":"text"},{"key":"region","label":"Région","type":"text"},{"key":"formation","label":"Formation vendue","type":"text"},{"key":"date","label":"Date","type":"date"},{"key":"montant","label":"Montant","type":"text"}],"rows":[{"rep":"Mélanie Côté","region":"MTL","formation":"Tireur actif","date":"2026-01-08","montant":"1 250,00 $"},{"rep":"Karl Bélanger","region":"QC","formation":"Code noir","date":"2026-01-12","montant":"980,00 $"},{"rep":"Mélanie Côté","region":"GAT","formation":"Gestion de crise","date":"2026-01-19","montant":"1 480,00 $"},{"rep":"Sophie Tremblay","region":"MTL","formation":"Gardiennage de base","date":"2026-01-23","montant":"750,00 $"},{"rep":"Karl Bélanger","region":"QC","formation":"Tireur actif","date":"2026-01-27","montant":"1 250,00 $"},{"rep":"Sophie Tremblay","region":"GAT","formation":"Code noir","date":"2026-01-30","montant":"980,00 $"}],"objectives":[{"id":"obj1","label":"Empiler février sous janvier","hint":"Dans le ruban, cliquez Ajouter des requêtes (Append) pour empiler les ventes de février sous celles de janvier.","demoCaption":"On empile les ventes de février sous celles de janvier. Mêmes colonnes, plus de lignes.","stepLabel":"Février empilé","action":{"type":"appendQuery","params":{"rows":[{"rep":"Karl Bélanger","region":"GAT","formation":"Gestion de crise","date":"2026-02-05","montant":"1 480,00 $"},{"rep":"Mélanie Côté","region":"MTL","formation":"Tireur actif","date":"2026-02-11","montant":"1 250,00 $"},{"rep":"Sophie Tremblay","region":"QC","formation":"Code noir","date":"2026-02-18","montant":"980,00 $"}],"note":"Feuille Février"}}},{"id":"obj2","label":"Fusionner pour ramener le superviseur","hint":"Cliquez Fusionner les requêtes (Merge), choisissez la colonne Représentant comme clé, et ramenez la colonne Superviseur depuis la table Représentants.","demoCaption":"On fusionne avec la table Représentants pour ramener le superviseur, par la clé du représentant.","stepLabel":"Superviseur fusionné","action":{"type":"mergeQuery","params":{"keyCol":"rep","bring":[{"key":"superviseur","label":"Superviseur","lookup":{"Mélanie Côté":"Daniel Roy","Karl Bélanger":"Daniel Roy","Sophie Tremblay":"Isabelle Gagnon"}}],"note":"Table Représentants"}}}]}},{"lessonId":"05-actualiser","lessonIndex":"5.1","title":"Les étapes appliquées et l'actualisation","summary":"Comprendre que chaque action devient une étape rejouable, savoir nommer ces étapes, et utiliser l'actualisation pour réappliquer tout le nettoyage sur de nouvelles données sans rien refaire.","scenario":{"id":"05-actualiser","queryName":"Ventes formations - Février 2026","columns":[{"key":"representant","label":"Représentant","type":"text"},{"key":"region","label":"Région","type":"text"},{"key":"formation","label":"Formation","type":"text"},{"key":"montant","label":"Montant","type":"text"}],"rows":[{"representant":"Marie-Claude Bélanger","region":"MTL","formation":"Tireur actif","montant":"2 400,00 $"},{"representant":"Patrick Lavoie","region":"QC","formation":"Code noir","montant":"1 800,00 $"},{"representant":"Sophie Tremblay","region":"","formation":"Gestion de crise","montant":"3 200,00 $"},{"representant":"Jean-François Roy","region":"GAT","formation":"Tireur actif","montant":"2 400,00 $"},{"representant":"Nadia Cormier","region":"MTL","formation":"Code noir","montant":"1 800,00 $"},{"representant":"Éric Pelletier","region":"","formation":"Gardiennage événementiel","montant":"1 200,00 $"},{"representant":"Valérie Gagnon","region":"QC","formation":"Gestion de crise","montant":"3 200,00 $"}],"objectives":[{"id":"obj-1","label":"Retirer les lignes sans région","hint":"Cliquez sur la flèche de filtre de la colonne « Région », puis décochez la valeur vide pour ne garder que les lignes avec une région.","demoCaption":"On filtre la colonne Région pour retirer les entrées vides.","stepLabel":"Lignes filtrées","action":{"type":"filterRows","target":"region","params":{"op":"notEquals","value":""}}},{"id":"obj-2","label":"Renommer l'étape","hint":"Dans le volet « Étapes appliquées » à droite, clic droit sur l'étape « Lignes filtrées », choisissez « Renommer » et tapez « Lignes vides retirées ».","demoCaption":"On renomme l'étape pour qu'elle se lise toute seule.","stepLabel":"Lignes vides retirées","action":{"type":"renameStep","params":{"stepIndex":1,"newName":"Lignes vides retirées"}}},{"id":"obj-3","label":"Actualiser avec les ventes de mars","hint":"Cliquez sur le bouton « Actualiser ». Les trois nouvelles lignes de mars 2026 arrivent et toutes les étapes se rejouent automatiquement.","demoCaption":"On actualise : les nouvelles données de mars passent par toute la recette.","stepLabel":"Source actualisée","action":{"type":"refresh","params":{"newRows":[{"representant":"Hugo Bérubé","region":"GAT","formation":"Gestion de crise","montant":"3 200,00 $"},{"representant":"Amélie Fortin","region":"MTL","formation":"Tireur actif","montant":"2 400,00 $"},{"representant":"Sami Khaled","region":"","formation":"Code noir","montant":"1 800,00 $"}]}}}]}},{"lessonId":"06-mini-projet","lessonIndex":"6.1","title":"Mini-projet : du fichier brut au rapport propre","summary":"Mettre en pratique, de façon autonome, tout le cours en transformant un fichier de ventes brut XGuard en rapport propre prêt à présenter.","scenario":{"id":"06-mini-projet","queryName":"Ventes_Formations_Mars2026","columns":[{"key":"rep","label":"Colonne1","type":"text"},{"key":"region","label":"Colonne2","type":"text"},{"key":"montant","label":"Colonne3","type":"text"},{"key":"date","label":"Colonne4","type":"text"},{"key":"transaction","label":"Colonne5","type":"text"},{"key":"notes","label":"Colonne6","type":"text"}],"rows":[{"rep":"Représentant","region":"Région","montant":"Montant","date":"Date","transaction":"Transaction","notes":"Notes internes"},{"rep":"Julie Tremblay","region":"MTL","montant":"1 450,00 $","date":"2026-03-03","transaction":"Vente","notes":"rappeler client"},{"rep":"Maxime Gagné","region":"QC","montant":"680,00 $","date":"2026-03-05","transaction":"Vente","notes":""},{"rep":"Sophie Bouchard","region":"GAT","montant":"2 300,00 $","date":"2026-03-09","transaction":"Vente","notes":"contrat municipal"},{"rep":"Karim Hadad","region":"MTL","montant":"540,00 $","date":"2026-03-12","transaction":"Annulation","notes":"remboursé"},{"rep":"Julie Tremblay","region":"MTL","montant":"1 200,00 $","date":"2026-03-15","transaction":"Vente","notes":""},{"rep":"Maxime Gagné","region":"QC","montant":"425,00 $","date":"2026-03-18","transaction":"Annulation","notes":"client annulé"},{"rep":"Sophie Bouchard","region":"GAT","montant":"890,00 $","date":"2026-03-22","transaction":"Vente","notes":"renouvellement"},{"montant":"7 485,00 $","total":true}],"objectives":[{"id":"obj-1-source","label":"Connecter la source","hint":"Défi autonome : ouvrez le sélecteur de source et choisissez le fichier Excel comme point de départ.","demoCaption":"On part du fichier Excel brut de mars 2026.","stepLabel":"Source","action":{"type":"chooseSource","params":{"source":"excel"}}},{"id":"obj-2-headers","label":"Promouvoir les en-têtes","hint":"La 1re ligne contient les vrais noms de colonnes : utilisez Utiliser la première ligne comme en-têtes.","demoCaption":"La première ligne devient les en-têtes.","stepLabel":"En-têtes promus","action":{"type":"promoteHeaders"}},{"id":"obj-3-remove-col","label":"Retirer la colonne inutile","hint":"Sélectionnez la colonne Notes internes, puis Supprimer les colonnes.","demoCaption":"On enlève la colonne Notes internes, inutile au rapport.","stepLabel":"Colonnes supprimées","action":{"type":"removeColumn","target":"notes"}},{"id":"obj-4-remove-total","label":"Supprimer la ligne TOTAL","hint":"La ligne de total est tout en bas : Supprimer les lignes du bas, en retirer 1.","demoCaption":"On retire la ligne TOTAL collée au bas du tableau.","stepLabel":"Lignes du bas supprimées","action":{"type":"removeBottomRows","params":{"count":1}}},{"id":"obj-5-type","label":"Convertir le montant","hint":"Colonne Montant : changez le type en nombre décimal pour pouvoir calculer.","demoCaption":"Le montant passe de texte à nombre décimal.","stepLabel":"Type modifié","action":{"type":"changeType","target":"montant","params":{"toType":"decimal"}}},{"id":"obj-6-filter","label":"Filtrer les annulations","hint":"Colonne Transaction : filtrez pour ne garder que les lignes égales à Vente.","demoCaption":"On garde seulement les ventes, pas les annulations.","stepLabel":"Lignes filtrées","action":{"type":"filterRows","target":"transaction","params":{"op":"equals","value":"Vente"}}},{"id":"obj-7-conditional","label":"Classer chaque vente","hint":"Créez une colonne conditionnelle Catégorie : si Montant > 1000 alors Contrat majeur, sinon Vente standard.","demoCaption":"Chaque vente se range en Contrat majeur ou Vente standard.","stepLabel":"Catégorie ajoutée","action":{"type":"conditionalColumn","params":{"newKey":"categorie","label":"Catégorie","ifCol":"montant","op":"greaterThan","value":"1000","thenValue":"Contrat majeur","elseValue":"Vente standard"}}}]}}];
+pqxInit(document.getElementById('pqx-root'), SCENARIOS);
+})();
+</script>
+</body>
+</html>
